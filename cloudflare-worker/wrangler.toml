@@ -1,0 +1,32 @@
+name = "dmarczero-worker"
+main = "src/index.ts"
+compatibility_date = "2025-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+BRAND_NAME = "ApexHive Labs"
+PRODUCT_ID = "dmarczero"
+MONITORED_DOMAINS = ""
+ALLOWED_ORIGINS = ""
+PASS_RATE_ALERT_THRESHOLD = "90"
+PAY_TO_EVM_ADDRESS = "0x32eceaC45DBED9E555dAb80346aBd4Ab9C676206"
+BASE_USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+BASE_CHAIN_ID = "8453"
+BASE_RPC_URL = "https://mainnet.base.org"
+BASE_RPC_URLS = "https://mainnet.base.org,https://base-rpc.publicnode.com,https://1rpc.io/base"
+TEAM_PRICE_USDC_ATOMIC = "99000000"
+ENTERPRISE_PRICE_USDC_ATOMIC = "499000000"
+MIN_CONFIRMATIONS = "2"
+CHALLENGE_TTL_SECONDS = "300"
+LICENSE_SIGNING_PUBLIC_SPKI_B64 = "MCowBQYDK2VwAyEArz/+yUqh9Alo5B2DPD23q2vbvAuPPL5m1zqtHg66cA0="
+
+[triggers]
+crons = ["0 2 * * *"]
+
+[[durable_objects.bindings]]
+name = "DMARC_STORE"
+class_name = "DmarcStoreDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DmarcStoreDO"]
