@@ -5,7 +5,15 @@ import tls from 'node:tls';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { auditTls, auditDns, createSnapshot, diffSnapshots, saveSnapshot, loadSnapshot } from '../dist/index.js';
+import {
+  auditTls,
+  auditDns,
+  createSnapshot,
+  diffSnapshots,
+  generateHtmlReport,
+  saveSnapshot,
+  loadSnapshot
+} from '../dist/index.js';
 
 function derLen(len) {
   if (len < 128) return Buffer.from([len]);
@@ -41,7 +49,7 @@ function derUtcTime(date) {
   return derTag(0x17, Buffer.from(`${yy}${mm}${dd}${hh}${mi}${ss}Z`, 'ascii'));
 }
 
-function createSelfSignedCertPem(daysValid = 45) {
+function createSelfSignedCertPem(daysValid = 45, cn = 'localhost') {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
   const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
   const keyPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
@@ -52,10 +60,10 @@ function createSelfSignedCertPem(daysValid = 45) {
     derTag(0x05, Buffer.alloc(0))
   ]);
   const cnAttr = derSet([
-    derSeq([derTag(0x06, Buffer.from([0x55, 0x04, 0x03])), derTag(0x0c, Buffer.from('localhost', 'utf8'))])
+    derSeq([derTag(0x06, Buffer.from([0x55, 0x04, 0x03])), derTag(0x0c, Buffer.from(cn, 'utf8'))])
   ]);
   const orgAttr = derSet([
-    derSeq([derTag(0x06, Buffer.from([0x55, 0x04, 0x0a])), derTag(0x0c, Buffer.from('ApexHiveTest', 'utf8'))])
+    derSeq([derTag(0x06, Buffer.from([0x55, 0x04, 0x0a])), derTag(0x0c, Buffer.from('DMARCZeroTest', 'utf8'))])
   ]);
   const nameSeq = derSeq([cnAttr, orgAttr]);
 
@@ -64,6 +72,14 @@ function createSelfSignedCertPem(daysValid = 45) {
   const notAfter = new Date(now.getTime() + daysValid * 24 * 60 * 60 * 1000);
   const validity = derSeq([derUtcTime(notBefore), derUtcTime(notAfter)]);
 
+  // SAN extension (OID 2.5.29.17) with dNSName = cn
+  const sanExtValue = derSeq([derTag(0x82, Buffer.from(cn, 'ascii'))]);
+  const sanExt = derSeq([
+    derTag(0x06, Buffer.from([0x55, 0x1d, 0x11])),
+    derTag(0x04, sanExtValue)
+  ]);
+  const extensions = derTag(0xa3, derSeq([sanExt]));
+
   const tbs = derSeq([
     derTag(0xa0, derTag(0x02, Buffer.from([0x02]))), // version v3
     derTag(0x02, Buffer.from([0x01])), // serialNumber 1
@@ -71,7 +87,8 @@ function createSelfSignedCertPem(daysValid = 45) {
     nameSeq, // issuer
     validity,
     nameSeq, // subject
-    spkiDer
+    spkiDer,
+    extensions
   ]);
 
   const sigBytes = crypto.sign('sha256', tbs, privateKey);
@@ -82,12 +99,14 @@ function createSelfSignedCertPem(daysValid = 45) {
   return { keyPem, certPem };
 }
 
-describe('tls-audit: ephemeral local loopback TLS certificate expiry checks', () => {
+describe('tls-audit: ephemeral local loopback TLS certificate & trust checks', () => {
   let server;
   let port;
+  let serverCertPem;
 
   before(async () => {
-    const { keyPem, certPem } = createSelfSignedCertPem(45);
+    const { keyPem, certPem } = createSelfSignedCertPem(45, 'localhost');
+    serverCertPem = certPem;
     server = tls.createServer({ key: keyPem, cert: certPem }, (socket) => {
       socket.end();
     });
@@ -107,9 +126,11 @@ describe('tls-audit: ephemeral local loopback TLS certificate expiry checks', ()
     }
   });
 
-  it('reads certificate chain and classifies >=30d as ok, <30d as warning, <14d as critical, <0d as expired', async () => {
-    const okRes = await auditTls('127.0.0.1', { port, servername: 'localhost' });
+  it('reads trusted cert chain and classifies >=30d as ok, <30d as warning, <14d as critical, <0d as expired', async () => {
+    const okRes = await auditTls('127.0.0.1', { port, servername: 'localhost', ca: serverCertPem });
     assert.equal(okRes.reachable, true);
+    assert.equal(okRes.authorized, true);
+    assert.equal(okRes.authorizationError, null);
     assert.equal(okRes.status, 'ok');
     assert.ok(okRes.daysRemaining >= 30);
     assert.ok(okRes.issuerChain.length >= 1);
@@ -120,6 +141,7 @@ describe('tls-audit: ephemeral local loopback TLS certificate expiry checks', ()
     const warnRes = await auditTls('127.0.0.1', {
       port,
       servername: 'localhost',
+      ca: serverCertPem,
       now: new Date(validToMs - 20 * 24 * 60 * 60 * 1000)
     });
     assert.equal(warnRes.status, 'warning');
@@ -127,6 +149,7 @@ describe('tls-audit: ephemeral local loopback TLS certificate expiry checks', ()
     const critRes = await auditTls('127.0.0.1', {
       port,
       servername: 'localhost',
+      ca: serverCertPem,
       now: new Date(validToMs - 7 * 24 * 60 * 60 * 1000)
     });
     assert.equal(critRes.status, 'critical');
@@ -134,9 +157,35 @@ describe('tls-audit: ephemeral local loopback TLS certificate expiry checks', ()
     const expRes = await auditTls('127.0.0.1', {
       port,
       servername: 'localhost',
+      ca: serverCertPem,
       now: new Date(validToMs + 2 * 24 * 60 * 60 * 1000)
     });
     assert.equal(expRes.status, 'expired');
+  });
+
+  it('never classifies untrusted self-signed or hostname-mismatched certificates as ok and surfaces trust in HTML report', async () => {
+    const selfSignedRes = await auditTls('127.0.0.1', { port, servername: 'localhost' });
+    assert.equal(selfSignedRes.reachable, true);
+    assert.equal(selfSignedRes.authorized, false);
+    assert.ok(selfSignedRes.authorizationError);
+    assert.equal(selfSignedRes.status, 'error');
+    assert.notEqual(selfSignedRes.status, 'ok');
+
+    const mismatchRes = await auditTls('127.0.0.1', {
+      port,
+      servername: 'mismatch.example.com',
+      ca: serverCertPem
+    });
+    assert.equal(mismatchRes.reachable, true);
+    assert.equal(mismatchRes.authorized, false);
+    assert.ok(mismatchRes.authorizationError);
+    assert.equal(mismatchRes.status, 'error');
+
+    const html = generateHtmlReport({ tls: mismatchRes });
+    assert.ok(html.includes('UNTRUSTED'));
+    assert.ok(html.includes('Authorization Error:'));
+    assert.ok(!html.includes('ApexHive'));
+    assert.ok(!/0x[0-9a-fA-F]{40}/.test(html));
   });
 });
 

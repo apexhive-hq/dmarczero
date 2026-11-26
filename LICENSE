@@ -1,42 +1,21 @@
-ApexHive Dual Source-Available License (v1.0 — Solo-Free Full-Open Model)
-Copyright (c) 2026 ApexHive Labs (apexhive.hq@proton.me)
+MIT License
 
-DMARCZero is distributed under a Dual Source-Available License designed to
-give individuals 100% full functionality permanently free while sustaining
-long-term engineering through commercial team and enterprise licensing.
+Copyright (c) 2026 ApexHive Labs
 
-1. SOLO LICENSE (0 USDC — Permanently Free, Full Features)
-   A single natural person ("Solo User") is granted a perpetual, worldwide,
-   royalty-free license to use, run, self-host, inspect, and modify DMARCZero
-   for personal or single-person non-team use with 100% of features unlocked.
-   No hardware-ID binding, no trial countdowns, and no artificial feature gates
-   are imposed.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-   Voluntary Base USDC Tip Address:
-   0x32eceaC45DBED9E555dAb80346aBd4Ab9C676206
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-2. COMMERCIAL LICENSES (Team & Enterprise)
-   Commercial use by an organization, agency, MSP, or team of 2 or more
-   individuals requires a valid Commercial License from ApexHive Labs:
-   - Team License (2-99 people / MSP multi-domain commercial):
-     Founder Early-Bird 99 USDC
-   - Enterprise License (100+ people / white-label deployment):
-     Founder Early-Bird 499 USDC
-
-   To obtain an offline Ed25519-signed commercial license certificate, contact:
-   apexhive.hq@proton.me
-
-3. RESTRICTIONS
-   - You may not redistribute DMARCZero as a competing hosted SaaS product
-     without an Enterprise white-label license.
-   - You must retain this copyright and license notice in all copies or
-     substantial portions of the Software.
-
-4. WARRANTY DISCLAIMER
-   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-   APEXHIVE LABS OR THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-   THE SOFTWARE.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

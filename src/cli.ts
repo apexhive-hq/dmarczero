@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 import { realpathSync } from 'node:fs';
-import { readFile, writeFile } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { auditDns, DEFAULT_DKIM_SELECTORS, type DnsResolver } from './dns-audit.js';
 import { auditTls } from './tls-audit.js';
 import { createSnapshot, diffSnapshots, loadSnapshot, saveSnapshot } from './diff.js';
 import { parseRuaPath } from './rua-parser.js';
 import { generateHtmlReport } from './report-html.js';
-import { verifyLicenseFile, APEXHIVE_BASE_USDC_ADDRESS } from './license.js';
 
 export interface CliRuntime {
   stdout: (line: string) => void;
@@ -51,7 +50,7 @@ function parseFlags(args: string[]): { positional: string[]; flags: Map<string, 
       } else {
         const key = token.slice(2);
         const next = args[i + 1];
-        if (next && !next.startsWith('--')) {
+        if (next !== undefined && !next.startsWith('--')) {
           flags.set(key, next);
           i += 1;
         } else {
@@ -68,18 +67,14 @@ function parseFlags(args: string[]): { positional: string[]; flags: Map<string, 
 
 function printHelp(out: (line: string) => void): void {
   out([
-    'DMARCZero v1.0.0 — DNS / DMARC / SSL Anti-Drift Guard (ApexHive Labs)',
+    'DMARCZero v1.0.0 — DNS / DMARC / TLS Anti-Drift Guard & RUA Aggregate Analyzer (MIT)',
     '',
     'Usage:',
     '  dmarczero check <domain> [--selectors s1,s2] [--port 443] [--no-tls] [--json]',
     '  dmarczero snapshot <domain> [--out dmarczero.snapshot.json] [--selectors s1,s2] [--no-tls]',
     '  dmarczero diff <domain> [--snapshot dmarczero.snapshot.json] [--fail-on-drift] [--no-tls] [--json]',
     '  dmarczero parse-rua <file_or_dir> [--json]',
-    '  dmarczero report <file_or_dir> [--out dmarc-report.html]',
-    '  dmarczero verify-license <license.json> [--pubkey pub.pem] [--json]',
-    '',
-    `Solo 0 USDC Forever | Team Early-Bird 99 USDC | Enterprise Early-Bird 499 USDC`,
-    `Voluntary Base USDC Tip: ${APEXHIVE_BASE_USDC_ADDRESS}`
+    '  dmarczero report <file_or_dir> [--out dmarc-report.html] [--title "..."] [--footer "..."]'
   ].join('\n'));
 }
 
@@ -130,7 +125,14 @@ export async function runCli(argv: string[], runtime?: Partial<CliRuntime>): Pro
         stdout(`  DKIM:  ${activeDkim.length > 0 ? activeDkim.map((d) => `${d.selector}(${d.keyBits ?? '?'}b)`).join(', ') : c.yellow('none found')}`);
         stdout(`  STS:   ${dns.mtaSts.present ? c.green('present') : c.yellow('missing')} | TLS-RPT: ${dns.tlsRpt.present ? c.green('present') : c.yellow('missing')} | CAA: ${dns.caa.present ? c.green(`${dns.caa.records.length} record(s)`) : c.yellow('missing')}`);
         if (tls) {
-          stdout(`  TLS:   ${tls.reachable ? `${tls.daysRemaining}d remaining (${colorStatus(tls.status)})` : c.red(`ERROR: ${tls.error ?? 'unreachable'}`)}`);
+          if (tls.reachable) {
+            const trustStr = tls.authorized
+              ? c.green('trusted')
+              : c.red(`UNTRUSTED: ${tls.authorizationError ?? 'verification failed'}`);
+            stdout(`  TLS:   ${tls.daysRemaining}d remaining, ${trustStr} (${colorStatus(tls.status)})`);
+          } else {
+            stdout(`  TLS:   ${c.red(`ERROR: ${tls.error ?? 'unreachable'}`)}`);
+          }
         }
         if (dns.findings.length > 0) {
           stdout('  Findings:');
@@ -240,29 +242,13 @@ export async function runCli(argv: string[], runtime?: Partial<CliRuntime>): Pro
         return 2;
       }
       const outPath = typeof flags.get('out') === 'string' ? String(flags.get('out')) : 'dmarc-report.html';
+      const title = typeof flags.get('title') === 'string' ? String(flags.get('title')) : undefined;
+      const footerText = typeof flags.get('footer') === 'string' ? String(flags.get('footer')) : undefined;
       const rua = await parseRuaPath(target);
-      const html = generateHtmlReport({ rua });
+      const html = generateHtmlReport({ rua, title, footerText });
       await writeFile(outPath, html, 'utf8');
       stdout(c.green(`Generated zero-CDN HTML report at ${outPath}`));
       return 0;
-    }
-
-    if (cmd === 'verify-license') {
-      const file = positional[0];
-      if (!file) {
-        stderr('Error: missing <license.json> argument for verify-license');
-        return 2;
-      }
-      const pubkeyPath = typeof flags.get('pubkey') === 'string' ? String(flags.get('pubkey')) : undefined;
-      const pubkeyPem = pubkeyPath ? await readFile(pubkeyPath, 'utf8') : undefined;
-      const res = await verifyLicenseFile(file, pubkeyPem);
-      if (asJson) {
-        stdout(JSON.stringify(res, null, 2));
-      } else {
-        stdout(`License Check: ${res.valid ? c.green('VALID') : c.yellow('UNVERIFIED')} | Tier: ${c.cyan(res.tier.toUpperCase())} | Features Unlocked: ${c.green(String(res.featuresUnlocked))}`);
-        stdout(`  Detail: ${res.reason}`);
-      }
-      return res.valid ? 0 : 1;
     }
 
     stderr(`Unknown command: ${cmd}`);

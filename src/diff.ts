@@ -20,6 +20,8 @@ export interface DomainSnapshot {
   tls: {
     host: string;
     port: number;
+    authorized?: boolean;
+    authorizationError?: string | null;
     fingerprint256: string | null;
     validTo: string | null;
     daysRemaining: number | null;
@@ -74,6 +76,8 @@ export function createSnapshot(dnsReport: DnsAuditReport, tlsResult: TlsAuditRes
       ? {
           host: tlsResult.host,
           port: tlsResult.port,
+          authorized: tlsResult.authorized,
+          authorizationError: tlsResult.authorizationError,
           fingerprint256: tlsResult.fingerprint256,
           validTo: tlsResult.validTo,
           daysRemaining: tlsResult.daysRemaining,
@@ -196,6 +200,21 @@ export function diffSnapshots(baseline: DomainSnapshot, current: DomainSnapshot)
         before: baseline.tls.fingerprint256 ?? '(none)',
         after: current.tls.fingerprint256 ?? '(none)',
         message: 'TLS certificate fingerprint changed'
+      });
+    }
+    if (
+      baseline.tls.authorized !== undefined &&
+      current.tls.authorized !== undefined &&
+      baseline.tls.authorized !== current.tls.authorized
+    ) {
+      changes.push({
+        field: 'tls.authorized',
+        severity: current.tls.authorized ? 'warn' : 'error',
+        before: String(baseline.tls.authorized),
+        after: String(current.tls.authorized),
+        message: current.tls.authorized
+          ? 'TLS certificate trust restored'
+          : `TLS certificate became untrusted (${current.tls.authorizationError ?? 'verification failed'})`
       });
     }
     if (current.tls.status === 'critical' || current.tls.status === 'expired' || current.tls.status === 'error') {

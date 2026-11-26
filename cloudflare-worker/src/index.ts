@@ -5,6 +5,7 @@ import {
   handleWorkerScheduled,
   type Env
 } from './worker-app.js';
+import { readBoundedEmailStream } from './email-handler.js';
 
 export { DmarcStoreDO };
 
@@ -13,7 +14,13 @@ export default {
     return handleWorkerFetch(request, env);
   },
   async email(message: ForwardableEmailMessage, env: Env): Promise<void> {
-    const rawText = await new Response(message.raw).text();
+    let rawText: string;
+    try {
+      rawText = await readBoundedEmailStream(message.raw, message.rawSize);
+    } catch (err: unknown) {
+      message.setReject(err instanceof Error ? err.message : 'Incoming email exceeds maximum allowed size');
+      return;
+    }
     const res = await handleWorkerEmail(rawText, env);
     if (!res.accepted && res.rejectedReason?.toLowerCase().includes('ruf')) {
       message.setReject('DMARCZero rejects RUF forensic reports to protect email privacy');

@@ -1,10 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import crypto from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { runCli, signLicensePayload } from '../dist/index.js';
+import { runCli } from '../dist/index.js';
 
 function createCapturedRuntime(resolver) {
   const out = [];
@@ -70,7 +69,7 @@ describe('cli: E2E offline workflow tests', () => {
     }
   });
 
-  it('runs parse-rua and report on a directory containing RUA + rejected RUF', async () => {
+  it('runs parse-rua and white-label report on a directory containing RUA + rejected RUF', async () => {
     const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'dmarczero-rua-cli-'));
     try {
       const ruaXml = `<feedback><report_metadata><org_name>yahoo.com</org_name><email>dmarc@yahoo.com</email><report_id>r1</report_id><date_range><begin>1</begin><end>2</end></date_range></report_metadata><policy_published><domain>cli.example</domain><p>reject</p></policy_published><record><row><source_ip>192.0.2.5</source_ip><count>10</count><policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>pass</spf></policy_evaluated></row><identifiers><header_from>cli.example</header_from></identifiers></record></feedback>`;
@@ -87,58 +86,39 @@ describe('cli: E2E offline workflow tests', () => {
 
       const reportOut = path.join(tmpDir, 'out.html');
       const c2 = createCapturedRuntime();
-      const code2 = await runCli(['report', tmpDir, '--out', reportOut], c2.runtime);
+      const code2 = await runCli(
+        ['report', tmpDir, '--out', reportOut, '--title', 'Acme Client Audit', '--footer', 'Prepared by Acme SecOps'],
+        c2.runtime
+      );
       assert.equal(code2, 0);
       const html = readFileSync(reportOut, 'utf8');
-      assert.ok(html.includes('DMARCZero'));
+      assert.ok(html.includes('Acme Client Audit'));
+      assert.ok(html.includes('Prepared by Acme SecOps'));
       assert.ok(html.includes('192.0.2.5'));
+      assert.ok(!/0x[0-9a-fA-F]{40}/.test(html));
+      assert.ok(!html.includes('USDC'));
+      assert.ok(!html.includes('ApexHive'));
+
+      // --footer "" must suppress the default footer cleanly
+      const noFooterOut = path.join(tmpDir, 'nofooter.html');
+      const c3 = createCapturedRuntime();
+      const code3 = await runCli(
+        ['report', tmpDir, '--out', noFooterOut, '--footer', ''],
+        c3.runtime
+      );
+      assert.equal(code3, 0);
+      const noFooterHtml = readFileSync(noFooterOut, 'utf8');
+      assert.ok(!noFooterHtml.includes('<footer>'));
+      assert.ok(!noFooterHtml.includes('MIT Open Source'));
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 
-  it('verifies Ed25519 Team/Enterprise license offline while never locking features', async () => {
-    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'dmarczero-lic-'));
-    try {
-      const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
-      const pubPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
-      const privPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
-
-      const cert = signLicensePayload({
-        product: 'dmarczero',
-        tier: 'team',
-        holder: 'Acme MSP',
-        seats: 15,
-        issuedAt: '2026-11-26T00:00:00.000Z'
-      }, privPem);
-
-      const pubPath = path.join(tmpDir, 'pub.pem');
-      const licPath = path.join(tmpDir, 'license.json');
-      writeFileSync(pubPath, pubPem, 'utf8');
-      writeFileSync(licPath, JSON.stringify(cert), 'utf8');
-
-      const c1 = createCapturedRuntime();
-      const code1 = await runCli(['verify-license', licPath, '--pubkey', pubPath, '--json'], c1.runtime);
-      assert.equal(code1, 0);
-      const res1 = JSON.parse(c1.out.join('\n'));
-      assert.equal(res1.valid, true);
-      assert.equal(res1.tier, 'team');
-      assert.equal(res1.featuresUnlocked, true);
-
-      // Tampered signature still keeps featuresUnlocked === true
-      const tampered = { ...cert, signature: 'invalid-sig' };
-      const badPath = path.join(tmpDir, 'bad.json');
-      writeFileSync(badPath, JSON.stringify(tampered), 'utf8');
-
-      const c2 = createCapturedRuntime();
-      const code2 = await runCli(['verify-license', badPath, '--pubkey', pubPath, '--json'], c2.runtime);
-      assert.equal(code2, 1);
-      const res2 = JSON.parse(c2.out.join('\n'));
-      assert.equal(res2.valid, false);
-      assert.equal(res2.tier, 'solo');
-      assert.equal(res2.featuresUnlocked, true);
-    } finally {
-      rmSync(tmpDir, { recursive: true, force: true });
-    }
+  it('rejects removed commercial verify-license command cleanly', async () => {
+    const c = createCapturedRuntime();
+    const code = await runCli(['verify-license', 'license.json'], c.runtime);
+    assert.equal(code, 2);
+    assert.ok(c.err.join('\n').includes('Unknown command'));
   });
 });

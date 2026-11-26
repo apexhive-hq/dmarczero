@@ -82,6 +82,7 @@ export interface RuaDirectoryResult {
 }
 
 const DEFAULT_MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024; // 50 MB zip-bomb / OOM guard
+const MAX_ZIP_ENTRIES = 64;
 
 function decodeXmlEntities(text: string): string {
   return text
@@ -127,7 +128,7 @@ export function isRufPayload(sample: string, filenameHint?: string): boolean {
 
 /**
  * Constant-memory streaming parser for DMARC RUA XML streams.
- * Processes each <record>...</record> block incrementally and releases XML chunks immediately.
+ * Continuously inspects the full stream for RUF PII indicators and processes each <record> block incrementally.
  */
 export async function parseRuaXmlStream(
   stream: Readable,
@@ -141,7 +142,9 @@ export async function parseRuaXmlStream(
 
   let totalBytes = 0;
   let buffer = '';
-  let checkedHeader = false;
+  let rufTail = '';
+  let sawOriginalMailFrom = false;
+  let sawArrivalDate = false;
   let sawFeedbackRoot = false;
 
   const metadata: RuaReportMetadata = {
@@ -171,7 +174,22 @@ export async function parseRuaXmlStream(
 
   const sourceMap = new Map<string, RuaSourceSummary>();
 
+  const inspectChunkForRuf = (chunkStr: string) => {
+    const windowText = rufTail + chunkStr;
+    if (/Original-Mail-From:/i.test(windowText)) sawOriginalMailFrom = true;
+    if (/Arrival-Date:/i.test(windowText)) sawArrivalDate = true;
+    if ((sawOriginalMailFrom && sawArrivalDate) || isRufPayload(windowText)) {
+      stream.destroy();
+      throw new RufRejectedError();
+    }
+    rufTail = windowText.slice(-512);
+  };
+
   const processRecordBlock = (recXml: string) => {
+    if (isRufPayload(recXml)) {
+      throw new RufRejectedError();
+    }
+
     const rowXml = extractTag(recXml, 'row');
     const sourceIp = extractTag(rowXml || recXml, 'source_ip') || 'unknown';
     const countRaw = extractTag(rowXml || recXml, 'count');
@@ -254,41 +272,37 @@ export async function parseRuaXmlStream(
       throw new RuaLimitError(`Uncompressed RUA XML exceeds safety limit of ${maxBytes} bytes`);
     }
 
-    buffer += chunkBuf.toString('utf8');
-
-    if (!checkedHeader && buffer.length >= 256) {
-      checkedHeader = true;
-      if (isRufPayload(buffer)) {
-        stream.destroy();
-        throw new RufRejectedError();
-      }
-    }
+    const chunkStr = chunkBuf.toString('utf8');
+    inspectChunkForRuf(chunkStr);
+    buffer += chunkStr;
 
     if (!sawFeedbackRoot && /<feedback[\s>]/i.test(buffer)) {
       sawFeedbackRoot = true;
     }
 
-    // Extract report_metadata once complete
-    const metaEnd = buffer.indexOf('</report_metadata>');
-    if (metaEnd !== -1) {
-      const metaStart = buffer.indexOf('<report_metadata');
-      if (metaStart !== -1 && metaStart < metaEnd) {
-        const metaXml = buffer.slice(metaStart, metaEnd + '</report_metadata>'.length);
+    // Extract report_metadata once complete (case-insensitive)
+    const metaEndMatch = /<\/report_metadata>/i.exec(buffer);
+    if (metaEndMatch) {
+      const metaStartMatch = /<report_metadata(?:\s[^>]*)?>/i.exec(buffer);
+      if (metaStartMatch && metaStartMatch.index < metaEndMatch.index) {
+        const metaEndIdx = metaEndMatch.index + metaEndMatch[0].length;
+        const metaXml = buffer.slice(metaStartMatch.index, metaEndIdx);
         metadata.orgName = extractTag(metaXml, 'org_name');
         metadata.email = extractTag(metaXml, 'email');
         metadata.reportId = extractTag(metaXml, 'report_id');
         metadata.dateRangeBegin = Number.parseInt(extractTag(metaXml, 'begin') || '0', 10) || 0;
         metadata.dateRangeEnd = Number.parseInt(extractTag(metaXml, 'end') || '0', 10) || 0;
-        buffer = buffer.slice(0, metaStart) + buffer.slice(metaEnd + '</report_metadata>'.length);
+        buffer = buffer.slice(0, metaStartMatch.index) + buffer.slice(metaEndIdx);
       }
     }
 
-    // Extract policy_published once complete
-    const polEnd = buffer.indexOf('</policy_published>');
-    if (polEnd !== -1) {
-      const polStart = buffer.indexOf('<policy_published');
-      if (polStart !== -1 && polStart < polEnd) {
-        const polXml = buffer.slice(polStart, polEnd + '</policy_published>'.length);
+    // Extract policy_published once complete (case-insensitive)
+    const polEndMatch = /<\/policy_published>/i.exec(buffer);
+    if (polEndMatch) {
+      const polStartMatch = /<policy_published(?:\s[^>]*)?>/i.exec(buffer);
+      if (polStartMatch && polStartMatch.index < polEndMatch.index) {
+        const polEndIdx = polEndMatch.index + polEndMatch[0].length;
+        const polXml = buffer.slice(polStartMatch.index, polEndIdx);
         policyPublished.domain = extractTag(polXml, 'domain');
         policyPublished.adkim = extractTag(polXml, 'adkim') || 'r';
         policyPublished.aspf = extractTag(polXml, 'aspf') || 'r';
@@ -296,7 +310,7 @@ export async function parseRuaXmlStream(
         policyPublished.sp = extractTag(polXml, 'sp') || policyPublished.p;
         const pctVal = Number.parseInt(extractTag(polXml, 'pct') || '100', 10);
         policyPublished.pct = Number.isFinite(pctVal) ? pctVal : 100;
-        buffer = buffer.slice(0, polStart) + buffer.slice(polEnd + '</policy_published>'.length);
+        buffer = buffer.slice(0, polStartMatch.index) + buffer.slice(polEndIdx);
       }
     }
 
@@ -320,13 +334,13 @@ export async function parseRuaXmlStream(
     }
   }
 
-  // Final check on short files
+  // Final check on remaining buffer
   if (isRufPayload(buffer)) {
     throw new RufRejectedError();
   }
 
   // Drain any remaining tags in buffer
-  if (!metadata.orgName && buffer.includes('</report_metadata>')) {
+  if (!metadata.orgName && /<\/report_metadata>/i.test(buffer)) {
     const metaXml = extractTag(buffer, 'report_metadata');
     metadata.orgName = extractTag(metaXml, 'org_name');
     metadata.email = extractTag(metaXml, 'email');
@@ -334,7 +348,7 @@ export async function parseRuaXmlStream(
     metadata.dateRangeBegin = Number.parseInt(extractTag(metaXml, 'begin') || '0', 10) || 0;
     metadata.dateRangeEnd = Number.parseInt(extractTag(metaXml, 'end') || '0', 10) || 0;
   }
-  if (!policyPublished.domain && buffer.includes('</policy_published>')) {
+  if (!policyPublished.domain && /<\/policy_published>/i.test(buffer)) {
     const polXml = extractTag(buffer, 'policy_published');
     policyPublished.domain = extractTag(polXml, 'domain');
     policyPublished.adkim = extractTag(polXml, 'adkim') || 'r';
@@ -372,63 +386,251 @@ export async function parseRuaXmlStream(
   };
 }
 
-/**
- * Zero-dependency ZIP extractor for single-entry RUA .zip archives (supports store=0 and deflate=8).
- */
-export function extractFirstZipEntryStream(zipBuffer: Buffer, maxUncompressedBytes = DEFAULT_MAX_UNCOMPRESSED_BYTES): {
+interface ZipEntrySpec {
   filename: string;
+  compressionMethod: number;
+  compressedSize: number;
+  uncompressedSize: number;
+  dataOffset: number;
+}
+
+function findEocdOffset(zipBuffer: Buffer): number {
+  const eocdSig = 0x06054b50;
+  for (let i = zipBuffer.length - 22; i >= Math.max(0, zipBuffer.length - 65557); i--) {
+    if (zipBuffer.readUInt32LE(i) === eocdSig) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function collectZipEntriesFromCentralDirectory(zipBuffer: Buffer, eocdOffset: number): ZipEntrySpec[] {
+  const totalEntries = zipBuffer.readUInt16LE(eocdOffset + 10);
+  if (totalEntries > MAX_ZIP_ENTRIES) {
+    throw new RuaLimitError(`ZIP archive contains too many entries (${totalEntries} > ${MAX_ZIP_ENTRIES})`);
+  }
+  const cdSize = zipBuffer.readUInt32LE(eocdOffset + 12);
+  const cdOffset = zipBuffer.readUInt32LE(eocdOffset + 16);
+  if (cdOffset + cdSize > zipBuffer.length) {
+    throw new Error('Corrupt ZIP central directory bounds');
+  }
+
+  const entries: ZipEntrySpec[] = [];
+  let pos = cdOffset;
+
+  for (let idx = 0; idx < totalEntries; idx++) {
+    if (pos + 46 > zipBuffer.length || zipBuffer.readUInt32LE(pos) !== 0x02014b50) {
+      throw new Error('Invalid ZIP central directory entry');
+    }
+    const compressionMethod = zipBuffer.readUInt16LE(pos + 10);
+    const compressedSize = zipBuffer.readUInt32LE(pos + 20);
+    const uncompressedSize = zipBuffer.readUInt32LE(pos + 24);
+    const nameLen = zipBuffer.readUInt16LE(pos + 28);
+    const extraLen = zipBuffer.readUInt16LE(pos + 30);
+    const commentLen = zipBuffer.readUInt16LE(pos + 32);
+    const localHeaderOffset = zipBuffer.readUInt32LE(pos + 42);
+
+    if (pos + 46 + nameLen > zipBuffer.length) {
+      throw new Error('Corrupt ZIP central directory filename bounds');
+    }
+    const filename = zipBuffer.subarray(pos + 46, pos + 46 + nameLen).toString('utf8');
+
+    if (localHeaderOffset + 30 > zipBuffer.length || zipBuffer.readUInt32LE(localHeaderOffset) !== 0x04034b50) {
+      throw new Error(`Invalid ZIP local header for entry: ${filename}`);
+    }
+    const localNameLen = zipBuffer.readUInt16LE(localHeaderOffset + 26);
+    const localExtraLen = zipBuffer.readUInt16LE(localHeaderOffset + 28);
+    const dataOffset = localHeaderOffset + 30 + localNameLen + localExtraLen;
+
+    entries.push({
+      filename,
+      compressionMethod,
+      compressedSize,
+      uncompressedSize,
+      dataOffset
+    });
+
+    pos += 46 + nameLen + extraLen + commentLen;
+  }
+
+  return entries;
+}
+
+function collectZipEntriesFromLocalHeaders(zipBuffer: Buffer): ZipEntrySpec[] {
+  const entries: ZipEntrySpec[] = [];
+  let pos = 0;
+
+  while (pos + 30 <= zipBuffer.length && zipBuffer.readUInt32LE(pos) === 0x04034b50) {
+    if (entries.length >= MAX_ZIP_ENTRIES) {
+      throw new RuaLimitError(`ZIP archive exceeds max entries (${MAX_ZIP_ENTRIES})`);
+    }
+    const flags = zipBuffer.readUInt16LE(pos + 6);
+    if ((flags & 0x0008) !== 0) {
+      throw new Error('ZIP entry uses data descriptor without central directory');
+    }
+    const compressionMethod = zipBuffer.readUInt16LE(pos + 8);
+    const compressedSize = zipBuffer.readUInt32LE(pos + 18);
+    const uncompressedSize = zipBuffer.readUInt32LE(pos + 22);
+    const nameLen = zipBuffer.readUInt16LE(pos + 26);
+    const extraLen = zipBuffer.readUInt16LE(pos + 28);
+    const dataOffset = pos + 30 + nameLen + extraLen;
+    if (dataOffset > zipBuffer.length) {
+      throw new Error('Corrupt ZIP local header bounds');
+    }
+    const filename = zipBuffer.subarray(pos + 30, pos + 30 + nameLen).toString('utf8');
+    entries.push({
+      filename,
+      compressionMethod,
+      compressedSize,
+      uncompressedSize,
+      dataOffset
+    });
+    pos = dataOffset + compressedSize;
+  }
+
+  return entries;
+}
+
+/**
+ * Zero-dependency multi-entry ZIP extractor for RUA .zip archives (supports store=0 and deflate=8).
+ * Inspects ALL entries for RUF filenames and cumulative uncompressed byte caps.
+ */
+export function extractAllZipEntryStreams(
+  zipBuffer: Buffer,
+  maxUncompressedBytes = DEFAULT_MAX_UNCOMPRESSED_BYTES
+): Array<{
+  filename: string;
+  uncompressedSize: number;
   stream: Readable;
-} {
-  // Check local file header signature PK\x03\x04
+}> {
   if (zipBuffer.length < 30 || zipBuffer.readUInt32LE(0) !== 0x04034b50) {
     throw new Error('Invalid ZIP archive header');
   }
 
-  const flags = zipBuffer.readUInt16LE(6);
-  const compressionMethod = zipBuffer.readUInt16LE(8);
-  let compressedSize = zipBuffer.readUInt32LE(18);
-  let uncompressedSize = zipBuffer.readUInt32LE(22);
-  const fileNameLength = zipBuffer.readUInt16LE(26);
-  const extraFieldLength = zipBuffer.readUInt16LE(28);
-  const filename = zipBuffer.subarray(30, 30 + fileNameLength).toString('utf8');
-  const dataOffset = 30 + fileNameLength + extraFieldLength;
+  const eocdOffset = findEocdOffset(zipBuffer);
+  const specs = eocdOffset !== -1
+    ? collectZipEntriesFromCentralDirectory(zipBuffer, eocdOffset)
+    : collectZipEntriesFromLocalHeaders(zipBuffer);
 
-  // If data descriptor bit (bit 3) is set, locate central directory to get exact sizes
-  if ((flags & 0x0008) !== 0 || compressedSize === 0) {
-    const eocdSig = 0x06054b50;
-    let eocdOffset = -1;
-    for (let i = zipBuffer.length - 22; i >= Math.max(0, zipBuffer.length - 65557); i--) {
-      if (zipBuffer.readUInt32LE(i) === eocdSig) {
-        eocdOffset = i;
-        break;
+  if (specs.length === 0) {
+    throw new Error('ZIP archive contains no entries');
+  }
+
+  const out: Array<{ filename: string; uncompressedSize: number; stream: Readable }> = [];
+  let declaredTotal = 0;
+
+  for (const spec of specs) {
+    if (isRufPayload('', spec.filename)) {
+      throw new RufRejectedError(`Rejected RUF entry in ZIP archive: ${spec.filename}`);
+    }
+    if (spec.uncompressedSize > maxUncompressedBytes || declaredTotal + spec.uncompressedSize > maxUncompressedBytes) {
+      throw new RuaLimitError(
+        `ZIP entry "${spec.filename}" uncompressed size (${spec.uncompressedSize}) exceeds limit (${maxUncompressedBytes})`
+      );
+    }
+    if (spec.filename.endsWith('/') && spec.compressedSize === 0 && spec.uncompressedSize === 0) {
+      continue;
+    }
+    if (spec.dataOffset + spec.compressedSize > zipBuffer.length) {
+      throw new Error(`ZIP entry "${spec.filename}" is truncated`);
+    }
+
+    const slice = zipBuffer.subarray(spec.dataOffset, spec.dataOffset + spec.compressedSize);
+
+    if (spec.compressionMethod === 0) {
+      if (slice.length > maxUncompressedBytes || declaredTotal + slice.length > maxUncompressedBytes) {
+        throw new RuaLimitError(
+          `ZIP STORE entry "${spec.filename}" size (${slice.length}) exceeds limit (${maxUncompressedBytes})`
+        );
+      }
+      declaredTotal += slice.length;
+      out.push({ filename: spec.filename, uncompressedSize: slice.length, stream: Readable.from(slice) });
+    } else if (spec.compressionMethod === 8) {
+      declaredTotal += spec.uncompressedSize;
+      const inflate = zlib.createInflateRaw();
+      const src = Readable.from(slice);
+      src.on('error', (err) => inflate.destroy(err));
+      src.pipe(inflate);
+      out.push({ filename: spec.filename, uncompressedSize: spec.uncompressedSize, stream: inflate });
+    } else {
+      throw new Error(`Unsupported ZIP compression method: ${spec.compressionMethod}`);
+    }
+  }
+
+  return out;
+}
+
+export function extractFirstZipEntryStream(zipBuffer: Buffer, maxUncompressedBytes = DEFAULT_MAX_UNCOMPRESSED_BYTES): {
+  filename: string;
+  stream: Readable;
+} {
+  const entries = extractAllZipEntryStreams(zipBuffer, maxUncompressedBytes);
+  const first = entries[0];
+  if (!first) {
+    throw new Error('ZIP archive contains no readable file entries');
+  }
+  return { filename: first.filename, stream: first.stream };
+}
+
+function mergeRuaSummaries(summaries: RuaSummary[]): RuaSummary {
+  const first = summaries[0]!;
+  if (summaries.length === 1) return first;
+
+  let totalMessages = 0;
+  let dmarcPass = 0;
+  let dmarcFail = 0;
+  let spfPass = 0;
+  let spfFail = 0;
+  let dkimPass = 0;
+  let dkimFail = 0;
+  const sourceMap = new Map<string, RuaSourceSummary>();
+
+  for (const s of summaries) {
+    totalMessages += s.totalMessages;
+    dmarcPass += s.dmarcPass;
+    dmarcFail += s.dmarcFail;
+    spfPass += s.spfPass;
+    spfFail += s.spfFail;
+    dkimPass += s.dkimPass;
+    dkimFail += s.dkimFail;
+
+    for (const src of s.sources) {
+      const key = `${src.sourceIp}|${src.headerFrom.toLowerCase()}`;
+      const existing = sourceMap.get(key);
+      if (!existing) {
+        sourceMap.set(key, { ...src, dispositions: { ...src.dispositions } });
+      } else {
+        existing.totalCount += src.totalCount;
+        existing.dmarcPass += src.dmarcPass;
+        existing.dmarcFail += src.dmarcFail;
+        existing.spfPass += src.spfPass;
+        existing.dkimPass += src.dkimPass;
+        existing.suspicious = existing.suspicious || src.suspicious;
+        for (const [disp, cnt] of Object.entries(src.dispositions)) {
+          existing.dispositions[disp] = (existing.dispositions[disp] ?? 0) + cnt;
+        }
       }
     }
-    if (eocdOffset !== -1) {
-      const cdOffset = zipBuffer.readUInt32LE(eocdOffset + 16);
-      if (cdOffset + 46 <= zipBuffer.length && zipBuffer.readUInt32LE(cdOffset) === 0x02014b50) {
-        compressedSize = zipBuffer.readUInt32LE(cdOffset + 20);
-        uncompressedSize = zipBuffer.readUInt32LE(cdOffset + 24);
-      }
-    }
   }
 
-  if (uncompressedSize > maxUncompressedBytes) {
-    throw new RuaLimitError(`ZIP entry uncompressed size (${uncompressedSize}) exceeds limit (${maxUncompressedBytes})`);
-  }
+  const sources = [...sourceMap.values()].sort((a, b) => b.totalCount - a.totalCount);
+  const suspiciousSources = sources.filter((s) => s.suspicious);
+  const passRate = totalMessages > 0 ? Number(((dmarcPass / totalMessages) * 100).toFixed(2)) : 0;
 
-  const compressedData = compressedSize > 0
-    ? zipBuffer.subarray(dataOffset, dataOffset + compressedSize)
-    : zipBuffer.subarray(dataOffset);
-
-  if (compressionMethod === 0) {
-    return { filename, stream: Readable.from(compressedData) };
-  }
-  if (compressionMethod === 8) {
-    const inflate = zlib.createInflateRaw();
-    Readable.from(compressedData).pipe(inflate);
-    return { filename, stream: inflate };
-  }
-  throw new Error(`Unsupported ZIP compression method: ${compressionMethod}`);
+  return {
+    metadata: first.metadata,
+    policyPublished: first.policyPublished,
+    totalMessages,
+    dmarcPass,
+    dmarcFail,
+    spfPass,
+    spfFail,
+    dkimPass,
+    dkimFail,
+    passRate,
+    sources,
+    suspiciousSources
+  };
 }
 
 export async function parseRuaBuffer(data: Buffer, options: RuaParseOptions = {}): Promise<RuaSummary> {
@@ -446,8 +648,56 @@ export async function parseRuaBuffer(data: Buffer, options: RuaParseOptions = {}
 
   // ZIP magic bytes: 50 4b 03 04
   if (data.length >= 4 && data[0] === 0x50 && data[1] === 0x4b && data[2] === 0x03 && data[3] === 0x04) {
-    const { filename, stream } = extractFirstZipEntryStream(data, maxBytes);
-    return parseRuaXmlStream(stream, { ...options, filenameHint: filename, maxUncompressedBytes: maxBytes });
+    const entries = extractAllZipEntryStreams(data, maxBytes);
+    const entryErrors = new Map<Readable, Error>();
+    const errorHandlers = new Map<Readable, (err: Error) => void>();
+    for (const entry of entries) {
+      const handler = (err: Error) => {
+        entryErrors.set(entry.stream, err);
+      };
+      errorHandlers.set(entry.stream, handler);
+      entry.stream.on('error', handler);
+    }
+
+    const summaries: RuaSummary[] = [];
+    let cumulativeBudget = maxBytes;
+
+    for (const entry of entries) {
+      const preErr = entryErrors.get(entry.stream);
+      if (preErr) {
+        for (const other of entries) other.stream.destroy();
+        throw preErr;
+      }
+
+      let actualEntryBytes = 0;
+      const counted = new Readable({
+        read() {}
+      });
+      const existingHandler = errorHandlers.get(entry.stream);
+      if (existingHandler) entry.stream.off('error', existingHandler);
+      entry.stream.on('error', (err) => counted.destroy(err));
+      entry.stream.on('data', (chunk: Buffer) => {
+        actualEntryBytes += chunk.length;
+        if (actualEntryBytes > cumulativeBudget) {
+          const limitErr = new RuaLimitError(`Uncompressed ZIP entries exceed safety limit of ${maxBytes} bytes`);
+          entry.stream.destroy(limitErr);
+          counted.destroy(limitErr);
+          return;
+        }
+        counted.push(chunk);
+      });
+      entry.stream.on('end', () => counted.push(null));
+
+      const summary = await parseRuaXmlStream(counted, {
+        ...options,
+        filenameHint: entry.filename,
+        maxUncompressedBytes: cumulativeBudget
+      });
+      cumulativeBudget -= actualEntryBytes;
+      summaries.push(summary);
+    }
+
+    return mergeRuaSummaries(summaries);
   }
 
   // Plain XML
@@ -471,9 +721,22 @@ export async function parseRuaFile(filePath: string, options: RuaParseOptions = 
   }
 
   if (lower.endsWith('.zip')) {
+    const maxCompressedBytes = maxBytes;
+    const fileInfo = await stat(filePath);
+    if (fileInfo.size > maxCompressedBytes) {
+      throw new RuaLimitError(`ZIP file size (${fileInfo.size} bytes) exceeds safety limit of ${maxCompressedBytes} bytes`);
+    }
     const chunks: Buffer[] = [];
-    for await (const chunk of createReadStream(filePath)) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    let totalZipBytes = 0;
+    const stream = createReadStream(filePath);
+    for await (const chunk of stream) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalZipBytes += buf.length;
+      if (totalZipBytes > maxCompressedBytes) {
+        stream.destroy();
+        throw new RuaLimitError(`ZIP file stream exceeds safety limit of ${maxCompressedBytes} bytes`);
+      }
+      chunks.push(buf);
     }
     return parseRuaBuffer(Buffer.concat(chunks), { ...options, filenameHint: filename, maxUncompressedBytes: maxBytes });
   }

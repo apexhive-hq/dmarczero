@@ -1,72 +1,101 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import crypto from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { rm as rmAsync } from 'node:fs/promises';
-import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import zlib from 'node:zlib';
-
-const execFileAsync = promisify(execFile);
 import { DatabaseSync } from 'node:sqlite';
-import { privateKeyToAccount } from 'viem/accounts';
 import {
-  APEXHIVE_BASE_USDC_RECIPIENT,
-  BASE_USDC_CONTRACT,
   DmarcStoreDO,
   handleWorkerEmail,
   handleWorkerFetch,
   handleWorkerScheduled,
-  renderDashboardHtml
+  MAX_RATE_LIMIT_ROWS,
+  renderDashboardHtml,
+  WORKER_VERSION
 } from '../dist/worker-app.js';
-import { sendSafeWebhookAlert, validateWebhookUrl } from '../dist/cron-monitor.js';
+import {
+  MAX_MIME_PARTS,
+  MAX_UNCOMPRESSED_BYTES,
+  parseIncomingRuaMime,
+  readBoundedEmailStream
+} from '../dist/email-handler.js';
+import {
+  sendSafeWebhookAlert,
+  validateMonitoredDomain,
+  validateWebhookUrl
+} from '../dist/cron-monitor.js';
 
+const execFileAsync = promisify(execFile);
 const WORKER_DIR = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
-const BOOL_TRUE_HEX = '0x' + '0'.repeat(63) + '1';
-const BOOL_FALSE_HEX = '0x' + '0'.repeat(64);
-const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
-function padTopicAddr(addr) {
-  return '0x' + addr.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    c ^= buf[i];
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+  }
+  return (c ^ 0xffffffff) >>> 0;
 }
 
-function encodeUsdcTransferLog(from, to, atomicAmount) {
-  return {
-    address: BASE_USDC_CONTRACT,
-    topics: [ERC20_TRANSFER_TOPIC, padTopicAddr(from), padTopicAddr(to)],
-    data: '0x' + BigInt(atomicAmount).toString(16).padStart(64, '0')
-  };
-}
+function buildMultiEntryZip(entries) {
+  const localParts = [];
+  const cdParts = [];
+  let offset = 0;
 
-function canonicalizeLicensePayload(payload) {
-  return JSON.stringify({
-    product: payload.product,
-    tier: payload.tier,
-    holder: payload.holder,
-    seats: payload.seats,
-    issuedAt: payload.issuedAt,
-    txHash: payload.txHash
-  });
-}
+  for (const entry of entries) {
+    const nameBuf = Buffer.from(entry.filename, 'utf8');
+    const raw = Buffer.from(entry.data);
+    const method = entry.method ?? 8; // 0 = STORE, 8 = DEFLATE
+    const compressed = method === 0 ? raw : zlib.deflateRawSync(raw);
+    const crc = crc32(raw);
 
-async function generateEd25519Keypair() {
-  const pair = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
-  const privJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-  const spki = await crypto.subtle.exportKey('spki', pair.publicKey);
-  const pubPem = crypto
-    .createPublicKey({ key: Buffer.from(spki), format: 'der', type: 'spki' })
-    .export({ type: 'spki', format: 'pem' })
-    .toString();
-  return {
-    privateJwkJson: JSON.stringify(privJwk),
-    spkiB64: Buffer.from(spki).toString('base64'),
-    pubPem
-  };
+    const localHeader = Buffer.alloc(30 + nameBuf.length);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0, 6);
+    localHeader.writeUInt16LE(method, 8);
+    localHeader.writeUInt32LE(crc, 14);
+    localHeader.writeUInt32LE(compressed.length, 18);
+    localHeader.writeUInt32LE(raw.length, 22);
+    localHeader.writeUInt16LE(nameBuf.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+    nameBuf.copy(localHeader, 30);
+
+    const cdHeader = Buffer.alloc(46 + nameBuf.length);
+    cdHeader.writeUInt32LE(0x02014b50, 0);
+    cdHeader.writeUInt16LE(20, 4);
+    cdHeader.writeUInt16LE(20, 6);
+    cdHeader.writeUInt16LE(0, 8);
+    cdHeader.writeUInt16LE(method, 10);
+    cdHeader.writeUInt32LE(crc, 16);
+    cdHeader.writeUInt32LE(compressed.length, 20);
+    cdHeader.writeUInt32LE(raw.length, 24);
+    cdHeader.writeUInt16LE(nameBuf.length, 28);
+    cdHeader.writeUInt32LE(offset, 42);
+    nameBuf.copy(cdHeader, 46);
+
+    localParts.push(localHeader, compressed);
+    cdParts.push(cdHeader);
+    offset += localHeader.length + compressed.length;
+  }
+
+  const cdBuf = Buffer.concat(cdParts);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(cdBuf.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+
+  return Buffer.concat([...localParts, cdBuf, eocd]);
 }
 
 function createSqliteDoEnv(overrides = {}) {
@@ -104,42 +133,6 @@ function createSqliteDoEnv(overrides = {}) {
   return { env, db };
 }
 
-function startMockBaseRpc(state) {
-  const server = http.createServer(async (req, res) => {
-    if (req.url === '/flaky') {
-      state.flakyHits += 1;
-      const status = state.flakyHits % 2 === 1 ? 429 : 500;
-      res.writeHead(status, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: `simulated flaky RPC HTTP ${status}` }));
-      return;
-    }
-    if (req.url !== '/ok' || req.method !== 'POST') {
-      res.writeHead(404);
-      res.end('Not Found');
-      return;
-    }
-    const chunks = [];
-    for await (const c of req) chunks.push(c);
-    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    let result = null;
-    if (body.method === 'eth_blockNumber') {
-      result = '0x' + state.headBlock.toString(16);
-    } else if (body.method === 'eth_getTransactionReceipt') {
-      result = state.receipts.get(String(body.params?.[0] ?? '').toLowerCase()) ?? null;
-    } else if (body.method === 'eth_call') {
-      const data = String(body.params?.[0]?.data ?? '').toLowerCase();
-      const ok = data.includes(state.smartWalletAddr.slice(2).toLowerCase()) && data.includes('cc'.repeat(32));
-      result = ok ? BOOL_TRUE_HEX : BOOL_FALSE_HEX;
-    }
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ jsonrpc: '2.0', id: body.id ?? 1, result }));
-  });
-  return new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => resolve(server));
-  });
-}
-
 function getFreePort() {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
@@ -169,11 +162,26 @@ async function waitForHealth(url, proc, getLogs, timeoutMs = 45000) {
   throw new Error(`Timed out waiting for ${url}:\n${getLogs()}`);
 }
 
-describe('cloudflare-worker: Email RUA ingestion, provider attribution & RUF privacy firewall', () => {
-  it('ingests MIME email with gzipped RUA XML into SQLite DO with provider attribution via /api/summary', async () => {
-    const { env } = createSqliteDoEnv();
-    const xml = `<feedback><report_metadata><org_name>google.com</org_name><report_id>w-rep-1</report_id><date_range><begin>100</begin><end>200</end></date_range></report_metadata><policy_published><domain>worker.example</domain><p>reject</p></policy_published><record><row><source_ip>209.85.220.41</source_ip><count>25</count><policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>pass</spf></policy_evaluated></row><identifiers><header_from>worker.example</header_from></identifiers></record></feedback>`;
-    const gzB64 = zlib.gzipSync(Buffer.from(xml, 'utf8')).toString('base64');
+function makeSampleRuaXml(domain = 'worker.example', reportId = 'w-rep-1', passCount = 25, failCount = 0) {
+  return `<feedback><report_metadata><org_name>google.com</org_name><report_id>${reportId}</report_id><date_range><begin>100</begin><end>200</end></date_range></report_metadata><policy_published><domain>${domain}</domain><p>reject</p></policy_published>${
+    passCount > 0
+      ? `<record><row><source_ip>209.85.220.41</source_ip><count>${passCount}</count><policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>pass</spf></policy_evaluated></row><identifiers><header_from>${domain}</header_from></identifiers></record>`
+      : ''
+  }${
+    failCount > 0
+      ? `<record><row><source_ip>198.51.100.77</source_ip><count>${failCount}</count><policy_evaluated><disposition>reject</disposition><dkim>fail</dkim><spf>fail</spf></policy_evaluated></row><identifiers><header_from>${domain}</header_from></identifiers></record>`
+      : ''
+  }</feedback>`;
+}
+
+describe('cloudflare-worker: Email RUA ingestion, ZIP/MIME safety, and RUF privacy firewall', () => {
+  it('ingests MIME email with gzipped RUA XML into SQLite DO with provider attribution via authenticated /api/summary', async () => {
+    const token = 'super-secret-admin-token-123';
+    const { env } = createSqliteDoEnv({
+      DASHBOARD_ADMIN_TOKEN: token,
+      MONITORED_DOMAINS: 'worker.example'
+    });
+    const gzB64 = zlib.gzipSync(Buffer.from(makeSampleRuaXml(), 'utf8')).toString('base64');
     const rawMime = [
       'From: noreply@google.com',
       'To: dmarc@worker.example',
@@ -197,7 +205,12 @@ describe('cloudflare-worker: Email RUA ingestion, provider attribution & RUF pri
     assert.equal(ingest.accepted, true);
     assert.equal(ingest.stored, 1);
 
-    const summaryResp = await handleWorkerFetch(new Request('https://worker.local/api/summary'), env);
+    const summaryResp = await handleWorkerFetch(
+      new Request('https://worker.local/api/summary', {
+        headers: { authorization: `Bearer ${token}` }
+      }),
+      env
+    );
     assert.equal(summaryResp.status, 200);
     const summary = await summaryResp.json();
     assert.equal(summary.reports.length, 1);
@@ -207,8 +220,248 @@ describe('cloudflare-worker: Email RUA ingestion, provider attribution & RUF pri
     assert.equal(summary.reports[0].sources[0].providerId, 'google-workspace');
   });
 
+  it('supports nested multipart/* MIME parts and large >256KB gzipped RUA without DecompressionStream deadlock', async () => {
+    const bigRecords = Array.from({ length: 1200 }, (_, idx) =>
+      `<record><row><source_ip>209.85.220.${(idx % 200) + 1}</source_ip><count>1</count><policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>pass</spf></policy_evaluated></row><identifiers><header_from>nested.example</header_from></identifiers></record>`
+    ).join('');
+    const bigXml = `<feedback><report_metadata><org_name>google.com</org_name><report_id>big-1</report_id><date_range><begin>1</begin><end>2</end></date_range></report_metadata><policy_published><domain>nested.example</domain><p>reject</p></policy_published>${bigRecords}</feedback>`;
+    assert.ok(Buffer.byteLength(bigXml) > 256 * 1024);
+
+    const gzB64 = zlib.gzipSync(Buffer.from(bigXml, 'utf8')).toString('base64');
+    const nestedMime = [
+      'From: noreply@google.com',
+      'Content-Type: multipart/mixed; boundary="OUTER"',
+      '',
+      '--OUTER',
+      'Content-Type: multipart/related; boundary="INNER"',
+      '',
+      '--INNER',
+      'Content-Type: text/plain',
+      '',
+      'Nested wrapper body',
+      '--INNER',
+      'Content-Type: application/gzip',
+      'Content-Disposition: attachment; filename="nested.xml.gz"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      gzB64,
+      '--INNER--',
+      '--OUTER--'
+    ].join('\r\n');
+
+    const res = await parseIncomingRuaMime(nestedMime);
+    assert.equal(res.accepted, true);
+    assert.equal(res.reports.length, 1);
+    assert.equal(res.reports[0].totalMessages, 1200);
+  });
+
+  it('inspects ALL ZIP entries, handles 0-byte STORE safely, and enforces cumulative caps across attachments & raw stream', async () => {
+    const zipWithHiddenRuf = buildMultiEntryZip([
+      { filename: 'valid-rua.xml', method: 0, data: Buffer.from(makeSampleRuaXml(), 'utf8') },
+      { filename: 'hidden!ruf!2.xml', method: 8, data: Buffer.from('<feedback/>', 'utf8') }
+    ]);
+    const mimeRufZip = [
+      'Content-Type: multipart/mixed; boundary="Z1"',
+      '',
+      '--Z1',
+      'Content-Type: application/zip',
+      'Content-Disposition: attachment; filename="bundle.zip"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      zipWithHiddenRuf.toString('base64'),
+      '--Z1--'
+    ].join('\r\n');
+
+    const rufRes = await parseIncomingRuaMime(mimeRufZip);
+    assert.equal(rufRes.accepted, false);
+    assert.ok(rufRes.rejectedReason?.toLowerCase().includes('ruf'));
+
+    // 0-byte STORE entry followed by valid RUA XML entry must NOT slice entry #1 to EOF
+    const zeroStoreZip = buildMultiEntryZip([
+      { filename: 'empty.txt', method: 0, data: Buffer.alloc(0) },
+      { filename: 'valid.xml', method: 0, data: Buffer.from(makeSampleRuaXml('worker.example', 'z0'), 'utf8') }
+    ]);
+    const mimeZeroStore = [
+      'Content-Type: multipart/mixed; boundary="Z0"',
+      '',
+      '--Z0',
+      'Content-Type: application/zip',
+      'Content-Disposition: attachment; filename="z0.zip"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      zeroStoreZip.toString('base64'),
+      '--Z0--'
+    ].join('\r\n');
+    const z0Res = await parseIncomingRuaMime(mimeZeroStore);
+    assert.equal(z0Res.accepted, true);
+    assert.equal(z0Res.reports.length, 1);
+    assert.equal(z0Res.reports[0].reportId, 'z0');
+
+    // Enforce size cap on STORE (method=0) entries
+    const storeZip = buildMultiEntryZip([
+      { filename: 'big-store.xml', method: 0, data: Buffer.from('A'.repeat(2048), 'utf8') }
+    ]);
+    const mimeStoreZip = [
+      'Content-Type: multipart/mixed; boundary="Z2"',
+      '',
+      '--Z2',
+      'Content-Type: application/zip',
+      'Content-Disposition: attachment; filename="store.zip"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      storeZip.toString('base64'),
+      '--Z2--'
+    ].join('\r\n');
+    const storeCapRes = await parseIncomingRuaMime(mimeStoreZip, 1024);
+    assert.equal(storeCapRes.accepted, false);
+    assert.ok(storeCapRes.rejectedReason?.includes('exceeds'));
+
+    // Cumulative cap across multiple attachments (two 700-byte XML parts > 1024 cumulative budget)
+    const xmlPartA = makeSampleRuaXml('worker.example', 'a'.repeat(500));
+    const xmlPartB = makeSampleRuaXml('worker.example', 'b'.repeat(500));
+    assert.ok(xmlPartA.length > 600 && xmlPartA.length < 1024);
+    const twoPartsMime = [
+      'Content-Type: multipart/mixed; boundary="Z2B"',
+      '',
+      '--Z2B',
+      'Content-Type: application/xml',
+      'Content-Disposition: attachment; filename="a.xml"',
+      '',
+      xmlPartA,
+      '--Z2B',
+      'Content-Type: application/xml',
+      'Content-Disposition: attachment; filename="b.xml"',
+      '',
+      xmlPartB,
+      '--Z2B--'
+    ].join('\r\n');
+    const cumRes = await parseIncomingRuaMime(twoPartsMime, 1024);
+    assert.equal(cumRes.accepted, false);
+    assert.ok(cumRes.rejectedReason?.includes('exceeds'));
+
+    // Enforce size cap BEFORE Base64 decoding
+    const oversizedB64 = Buffer.alloc(MAX_UNCOMPRESSED_BYTES + 1024, 65).toString('base64');
+    const oversizedMime = [
+      'Content-Type: multipart/mixed; boundary="Z3"',
+      '',
+      '--Z3',
+      'Content-Type: application/xml',
+      'Content-Disposition: attachment; filename="huge.xml"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      oversizedB64,
+      '--Z3--'
+    ].join('\r\n');
+    const b64CapRes = await parseIncomingRuaMime(oversizedMime);
+    assert.equal(b64CapRes.accepted, false);
+    assert.ok(b64CapRes.rejectedReason?.includes('exceeds'));
+
+    // readBoundedEmailStream rejects oversized email stream before loading full message
+    const bigStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(600));
+        controller.enqueue(new Uint8Array(600));
+        controller.close();
+      }
+    });
+    await assert.rejects(
+      () => readBoundedEmailStream(bigStream, undefined, 1024),
+      (err) => err instanceof Error && err.message.includes('exceeds')
+    );
+
+    // Caps MIME parts at MAX_MIME_PARTS (64) against nested-multipart DoS
+    const manyParts = Array.from({ length: MAX_MIME_PARTS + 2 }, (_, idx) => [
+      '--MANY',
+      'Content-Type: text/plain',
+      '',
+      `part ${idx}`
+    ].join('\r\n')).join('\r\n');
+    const manyMime = `Content-Type: multipart/mixed; boundary="MANY"\r\n\r\n${manyParts}\r\n--MANY--`;
+    const manyRes = await parseIncomingRuaMime(manyMime);
+    assert.equal(manyRes.accepted, false);
+    assert.ok(manyRes.rejectedReason?.includes('MIME parts count exceeded'));
+  });
+
+  it('fails closed when MONITORED_DOMAINS is empty, enforces domain isolation & composite PK, and handles PASS_RATE_ALERT_THRESHOLD="0"', async () => {
+    const wrapXmlMime = (xml) => [
+      'Content-Type: multipart/mixed; boundary="M1"',
+      '',
+      '--M1',
+      'Content-Type: application/xml',
+      'Content-Disposition: attachment; filename="r.xml"',
+      '',
+      xml,
+      '--M1--'
+    ].join('\r\n');
+
+    // 1. Fail-closed when MONITORED_DOMAINS="" and ALLOW_UNLISTED_DOMAINS is not "true"
+    const { env: closedEnv } = createSqliteDoEnv({ MONITORED_DOMAINS: '' });
+    const closedRes = await handleWorkerEmail(wrapXmlMime(makeSampleRuaXml('any.example', 'rep-1')), closedEnv);
+    assert.equal(closedRes.accepted, false);
+    assert.equal(closedRes.stored, 0);
+    assert.ok(closedRes.rejectedReason?.includes('MONITORED_DOMAINS'));
+
+    // 2. Explicit ALLOW_UNLISTED_DOMAINS="true" allows ingestion when configured
+    const { env: openEnv } = createSqliteDoEnv({ ALLOW_UNLISTED_DOMAINS: 'true' });
+    const openRes = await handleWorkerEmail(wrapXmlMime(makeSampleRuaXml('any.example', 'rep-open')), openEnv);
+    assert.equal(openRes.accepted, true);
+    assert.equal(openRes.stored, 1);
+
+    // 3. Monitored domains + composite PK isolation (same report_id across domains does NOT overwrite)
+    const token = 'admin-tok';
+    const { env } = createSqliteDoEnv({
+      DASHBOARD_ADMIN_TOKEN: token,
+      MONITORED_DOMAINS: 'allowed.example, second.example',
+      PASS_RATE_ALERT_THRESHOLD: '0',
+      ALERT_WEBHOOK_URL: 'https://hooks.slack.com/services/T/B/X'
+    });
+
+    const unmonitoredRes = await handleWorkerEmail(wrapXmlMime(makeSampleRuaXml('evil.example', 'rep-evil')), env);
+    assert.equal(unmonitoredRes.accepted, false);
+    assert.equal(unmonitoredRes.stored, 0);
+    assert.ok(unmonitoredRes.rejectedReason?.includes('Unmonitored'));
+
+    let alertsTriggered = 0;
+    const mockFetch = async () => {
+      alertsTriggered += 1;
+      return new Response('ok', { status: 200 });
+    };
+    const r1 = await handleWorkerEmail(wrapXmlMime(makeSampleRuaXml('allowed.example', 'shared-id', 0, 10)), env, mockFetch);
+    const r2 = await handleWorkerEmail(wrapXmlMime(makeSampleRuaXml('second.example', 'shared-id', 15, 0)), env, mockFetch);
+    assert.equal(r1.accepted, true);
+    assert.equal(r1.stored, 1);
+    assert.equal(r2.accepted, true);
+    assert.equal(r2.stored, 1);
+    assert.equal(alertsTriggered, 0);
+
+    // Duplicate RUA (same domain, org_name, report_id) uses DO NOTHING and does NOT re-trigger webhook alerts
+    const { env: dupEnv } = createSqliteDoEnv({
+      MONITORED_DOMAINS: 'dup.example',
+      PASS_RATE_ALERT_THRESHOLD: '90',
+      ALERT_WEBHOOK_URL: 'https://hooks.slack.com/services/T/B/X'
+    });
+    let dupAlerts = 0;
+    const dupFetch = async () => {
+      dupAlerts += 1;
+      return new Response('ok', { status: 200 });
+    };
+    const d1 = await handleWorkerEmail(wrapXmlMime(makeSampleRuaXml('dup.example', 'dup-1', 0, 10)), dupEnv, dupFetch);
+    const d2 = await handleWorkerEmail(wrapXmlMime(makeSampleRuaXml('dup.example', 'dup-1', 0, 10)), dupEnv, dupFetch);
+    assert.equal(d1.stored, 1);
+    assert.equal(d2.stored, 0);
+    assert.equal(dupAlerts, 1);
+
+    const summary = await (
+      await handleWorkerFetch(
+        new Request('https://worker.local/api/summary', { headers: { authorization: `Bearer ${token}` } }),
+        env
+      )
+    ).json();
+    assert.equal(summary.reports.length, 2);
+  });
+
   it('strictly rejects RUF forensic emails without storing PII', async () => {
-    const { env } = createSqliteDoEnv();
+    const { env } = createSqliteDoEnv({ ALLOW_UNLISTED_DOMAINS: 'true' });
     const rufMime = [
       'From: postmaster@isp.example',
       'To: dmarc@worker.example',
@@ -226,20 +479,41 @@ describe('cloudflare-worker: Email RUA ingestion, provider attribution & RUF pri
   });
 });
 
-describe('cloudflare-worker: SSRF-protected webhook relay & Cron drift sentinel', () => {
-  it('blocks SSRF targets (HTTP, loopback, metadata IP, private IP, non-allowlisted hosts, 3xx redirects)', async () => {
+describe('cloudflare-worker: SSRF-protected webhook relay, Telegram chat_id & Cron FQDN sentinel', () => {
+  it('blocks SSRF targets (HTTP, loopback, IPv4, IPv6 ::ffff:/::, metadata, non-allowlisted hosts, 3xx redirects)', async () => {
     assert.equal(validateWebhookUrl('http://discord.com/api/webhooks/1/a').valid, false);
     assert.equal(validateWebhookUrl('https://127.0.0.1/hook').valid, false);
     assert.equal(validateWebhookUrl('https://169.254.169.254/latest/meta-data/').valid, false);
     assert.equal(validateWebhookUrl('https://10.0.0.5/internal').valid, false);
     assert.equal(validateWebhookUrl('https://localhost/hook').valid, false);
     assert.equal(validateWebhookUrl('https://[::1]/hook').valid, false);
+    assert.equal(validateWebhookUrl('https://[::]/hook').valid, false);
+    assert.equal(validateWebhookUrl('https://[::ffff:127.0.0.1]/hook').valid, false);
     assert.equal(validateWebhookUrl('https://evil.example.com/steal').valid, false);
     assert.equal(validateWebhookUrl('https://user:pass@discord.com/api/webhooks/1/a').valid, false);
 
     assert.equal(validateWebhookUrl('https://discord.com/api/webhooks/123/abc').valid, true);
     assert.equal(validateWebhookUrl('https://hooks.slack.com/services/T/B/X').valid, true);
     assert.equal(validateWebhookUrl('https://api.telegram.org/bot123/sendMessage').valid, true);
+
+    const tgMissing = await sendSafeWebhookAlert('https://api.telegram.org/bot123/sendMessage', 'hello');
+    assert.equal(tgMissing.sent, false);
+    assert.ok(tgMissing.reason?.includes('TELEGRAM_CHAT_ID'));
+
+    let tgBody = null;
+    let tgSignal = null;
+    const tgOk = await sendSafeWebhookAlert('https://api.telegram.org/bot123/sendMessage', 'drift alert', {
+      telegramChatId: '-100999888',
+      fetchFn: async (_url, init) => {
+        tgBody = JSON.parse(init.body);
+        tgSignal = init.signal;
+        return new Response('ok', { status: 200 });
+      }
+    });
+    assert.equal(tgOk.sent, true);
+    assert.equal(tgBody.chat_id, '-100999888');
+    assert.equal(tgBody.text, 'drift alert');
+    assert.ok(tgSignal instanceof AbortSignal);
 
     let seenRedirectMode = '';
     const redirectMockFetch = async (_url, init) => {
@@ -254,17 +528,27 @@ describe('cloudflare-worker: SSRF-protected webhook relay & Cron drift sentinel'
     assert.ok(res.reason?.includes('3xx'));
   });
 
-  it('detects DNS drift on second cron run and sends webhook alert', async () => {
+  it('validates MONITORED_DOMAINS as strict FQDNs and detects DNS drift on second cron run', async () => {
+    assert.equal(validateMonitoredDomain('localhost').valid, false);
+    assert.equal(validateMonitoredDomain('127.0.0.1').valid, false);
+    assert.equal(validateMonitoredDomain('[::ffff:127.0.0.1]').valid, false);
+    assert.equal(validateMonitoredDomain('169.254.169.254').valid, false);
+    assert.equal(validateMonitoredDomain('evil.com/path').valid, false);
+    assert.equal(validateMonitoredDomain('sentinel.example').valid, true);
+
     const { env } = createSqliteDoEnv({
-      MONITORED_DOMAINS: 'sentinel.example',
+      MONITORED_DOMAINS: 'sentinel.example, 127.0.0.1, localhost',
       ALERT_WEBHOOK_URL: 'https://hooks.slack.com/services/T00/B00/XYZ'
     });
 
     let currentSpf = 'v=spf1 ip4:203.0.113.1 -all';
     const alerts = [];
+    const fetchedUrls = [];
 
     const mockFetch = async (url, init) => {
       const u = String(url);
+      fetchedUrls.push(u);
+      assert.ok(init?.signal instanceof AbortSignal);
       if (u.startsWith('https://hooks.slack.com/')) {
         alerts.push(JSON.parse(init.body));
         return new Response('ok', { status: 200 });
@@ -283,7 +567,9 @@ describe('cloudflare-worker: SSRF-protected webhook relay & Cron drift sentinel'
 
     const run1 = await handleWorkerScheduled(env, mockFetch);
     assert.equal(run1.checked, 1);
+    assert.deepEqual(run1.skippedInvalid, ['127.0.0.1', 'localhost']);
     assert.equal(run1.alertsSent, 0);
+    assert.ok(!fetchedUrls.some((u) => u.includes('127.0.0.1') || u.includes('localhost')));
 
     currentSpf = 'v=spf1 ip4:203.0.113.1 +all';
     const run2 = await handleWorkerScheduled(env, mockFetch);
@@ -293,374 +579,235 @@ describe('cloudflare-worker: SSRF-protected webhook relay & Cron drift sentinel'
   });
 });
 
-describe('cloudflare-worker: CORS, Zero-XSS White-Label Dashboard & Real Base USDC Verification', () => {
-  it('enforces strict CORS (no wildcard *) and allows loopback + configured origins', async () => {
-    const { env } = createSqliteDoEnv({ ALLOWED_ORIGINS: 'https://ops.apexhive.example' });
+describe('cloudflare-worker: Fail-Closed Admin Auth, Rate Limit, Session Revocation, Strict CORS & Zero-XSS Dashboard', () => {
+  it('fails closed 503 when unset, enforces Bearer + DO-backed HttpOnly HMAC session revocation on logout, and rate-limits login (429)', async () => {
+    const { env: unconfiguredEnv } = createSqliteDoEnv();
+    const r503Api = await handleWorkerFetch(new Request('https://worker.local/api/summary'), unconfiguredEnv);
+    assert.equal(r503Api.status, 503);
+    const r503Dash = await handleWorkerFetch(new Request('https://worker.local/'), unconfiguredEnv);
+    assert.equal(r503Dash.status, 503);
 
-    const r1 = await handleWorkerFetch(
+    const healthResp = await handleWorkerFetch(new Request('https://worker.local/api/health'), unconfiguredEnv);
+    assert.equal(healthResp.status, 200);
+    const healthJson = await healthResp.json();
+    assert.deepEqual(healthJson, { ok: true, service: 'dmarczero-worker', version: WORKER_VERSION });
+    assert.equal(healthResp.headers.get('x-frame-options'), 'DENY');
+    assert.equal(healthResp.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(healthResp.headers.get('referrer-policy'), 'no-referrer');
+
+    const { env } = createSqliteDoEnv({ DASHBOARD_ADMIN_TOKEN: 'correct-horse-battery-staple' });
+
+    const r401Api = await handleWorkerFetch(new Request('https://worker.local/api/summary'), env);
+    assert.equal(r401Api.status, 401);
+    const r401Dash = await handleWorkerFetch(new Request('https://worker.local/'), env);
+    assert.equal(r401Dash.status, 401);
+    const r401Html = await r401Dash.text();
+    assert.ok(!r401Html.includes('Export White-Label HTML Report'));
+
+    const rBadBearer = await handleWorkerFetch(
+      new Request('https://worker.local/api/summary', { headers: { authorization: 'Bearer wrong-token' } }),
+      env
+    );
+    assert.equal(rBadBearer.status, 401);
+
+    // Login -> sets HttpOnly HMAC cookie tracked in DO
+    const loginResp = await handleWorkerFetch(
+      new Request('https://worker.local/api/auth/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'cf-connecting-ip': '203.0.113.10' },
+        body: JSON.stringify({ token: 'correct-horse-battery-staple' })
+      }),
+      env
+    );
+    assert.equal(loginResp.status, 200);
+    const setCookie = loginResp.headers.get('set-cookie') ?? '';
+    assert.ok(setCookie.includes('HttpOnly'));
+    assert.ok(setCookie.includes('SameSite=Strict'));
+    assert.ok(setCookie.includes('Secure'));
+    const cookiePair = setCookie.split(';')[0];
+
+    const authedDash = await handleWorkerFetch(
+      new Request('https://worker.local/', { headers: { cookie: cookiePair } }),
+      env
+    );
+    assert.equal(authedDash.status, 200);
+    assert.equal(authedDash.headers.get('x-frame-options'), 'DENY');
+    assert.equal(authedDash.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(authedDash.headers.get('referrer-policy'), 'no-referrer');
+    assert.ok(authedDash.headers.get('content-security-policy')?.includes("frame-ancestors 'none'"));
+    const dashBody = await authedDash.text();
+    assert.ok(dashBody.includes('Export White-Label HTML Report'));
+
+    const authedSummary = await handleWorkerFetch(
+      new Request('https://worker.local/api/summary', { headers: { cookie: cookiePair } }),
+      env
+    );
+    assert.equal(authedSummary.status, 200);
+
+    // Logout revokes session nonce in DO -> replaying old cookie fails 401
+    const logoutResp = await handleWorkerFetch(
+      new Request('https://worker.local/api/auth/logout', {
+        method: 'POST',
+        headers: { cookie: cookiePair }
+      }),
+      env
+    );
+    assert.equal(logoutResp.status, 200);
+
+    const replayedSummary = await handleWorkerFetch(
+      new Request('https://worker.local/api/summary', { headers: { cookie: cookiePair } }),
+      env
+    );
+    assert.equal(replayedSummary.status, 401);
+
+    // Rate limiting: 5 attempts allowed per 60s window per IP, 6th returns 429
+    for (let i = 0; i < 5; i++) {
+      const bad = await handleWorkerFetch(
+        new Request('https://worker.local/api/auth/login', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'cf-connecting-ip': '198.51.100.99' },
+          body: JSON.stringify({ token: 'wrong' })
+        }),
+        env
+      );
+      assert.equal(bad.status, 401);
+    }
+    const limited = await handleWorkerFetch(
+      new Request('https://worker.local/api/auth/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'cf-connecting-ip': '198.51.100.99' },
+        body: JSON.stringify({ token: 'wrong' })
+      }),
+      env
+    );
+    assert.equal(limited.status, 429);
+    assert.ok(limited.headers.get('retry-after'));
+
+    // Authorization: Bearer brute-force rate limit (429 after 5 failed attempts on GET /api/summary & GET /)
+    for (let i = 0; i < 5; i++) {
+      const badBearer = await handleWorkerFetch(
+        new Request('https://worker.local/api/summary', {
+          headers: { authorization: 'Bearer wrong-secret', 'cf-connecting-ip': '198.51.100.77' }
+        }),
+        env
+      );
+      assert.equal(badBearer.status, 401);
+    }
+    const limitedBearerSummary = await handleWorkerFetch(
+      new Request('https://worker.local/api/summary', {
+        headers: { authorization: 'Bearer correct-horse-battery-staple', 'cf-connecting-ip': '198.51.100.77' }
+      }),
+      env
+    );
+    assert.equal(limitedBearerSummary.status, 429);
+    assert.ok(limitedBearerSummary.headers.get('retry-after'));
+    const limitedBearerDash = await handleWorkerFetch(
+      new Request('https://worker.local/', {
+        headers: { authorization: 'Bearer correct-horse-battery-staple', 'cf-connecting-ip': '198.51.100.77' }
+      }),
+      env
+    );
+    assert.equal(limitedBearerDash.status, 429);
+
+    // Valid Bearer resets rate limit counter for a clean IP
+    for (let i = 0; i < 3; i++) {
+      const bad = await handleWorkerFetch(
+        new Request('https://worker.local/api/summary', {
+          headers: { authorization: 'Bearer bad', 'cf-connecting-ip': '198.51.100.88' }
+        }),
+        env
+      );
+      assert.equal(bad.status, 401);
+    }
+    const okReset = await handleWorkerFetch(
+      new Request('https://worker.local/api/summary', {
+        headers: { authorization: 'Bearer correct-horse-battery-staple', 'cf-connecting-ip': '198.51.100.88' }
+      }),
+      env
+    );
+    assert.equal(okReset.status, 200);
+
+    // Caps login_rate_limits at MAX_RATE_LIMIT_ROWS (10_000) by evicting oldest window_start entries
+    const { env: capEnv, db: capDb } = createSqliteDoEnv();
+    const baseNow = 2_000_000_000;
+    const insertStmt = capDb.prepare(
+      `INSERT INTO login_rate_limits (client_key, attempts, window_start) VALUES (?, ?, ?)`
+    );
+    for (let i = 0; i < MAX_RATE_LIMIT_ROWS; i++) {
+      insertStmt.run(`ip-old-${i}`, 1, baseNow + (i === 0 ? 0 : 10));
+    }
+    const stub = capEnv.DMARC_STORE.get(capEnv.DMARC_STORE.idFromName('global'));
+    const capResp = await stub.fetch('https://dmarc-store/auth/rate-check', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientKey: 'ip-newest',
+        nowSec: baseNow + 20,
+        maxAttempts: 5,
+        windowSec: 60
+      })
+    });
+    assert.equal(capResp.status, 200);
+    assert.equal((await capResp.json()).allowed, true);
+    const totalRows = capDb.prepare(`SELECT COUNT(*) AS cnt FROM login_rate_limits`).get().cnt;
+    assert.equal(totalRows, MAX_RATE_LIMIT_ROWS);
+    const oldestStillPresent = capDb
+      .prepare(`SELECT client_key FROM login_rate_limits WHERE client_key = ?`)
+      .get('ip-old-0');
+    assert.equal(oldestStillPresent, undefined);
+    const newestPresent = capDb
+      .prepare(`SELECT client_key FROM login_rate_limits WHERE client_key = ?`)
+      .get('ip-newest');
+    assert.equal(newestPresent?.client_key, 'ip-newest');
+  });
+
+  it('enforces strict ALLOWED_ORIGINS CORS allowlist (never wildcard *)', async () => {
+    const { env } = createSqliteDoEnv({ ALLOWED_ORIGINS: 'https://ops.example, *' });
+
+    const rEvil = await handleWorkerFetch(
       new Request('https://worker.local/api/health', { headers: { origin: 'https://evil.example' } }),
       env
     );
-    assert.equal(r1.headers.get('access-control-allow-origin'), null);
+    assert.equal(rEvil.headers.get('access-control-allow-origin'), null);
 
-    const r2 = await handleWorkerFetch(
+    const rLocal = await handleWorkerFetch(
       new Request('https://worker.local/api/health', { headers: { origin: 'http://localhost:8787' } }),
       env
     );
-    assert.equal(r2.headers.get('access-control-allow-origin'), 'http://localhost:8787');
+    assert.equal(rLocal.headers.get('access-control-allow-origin'), null);
 
-    const r3 = await handleWorkerFetch(
-      new Request('https://worker.local/api/health', { headers: { origin: 'https://ops.apexhive.example' } }),
+    const rAllowed = await handleWorkerFetch(
+      new Request('https://worker.local/api/health', { headers: { origin: 'https://ops.example' } }),
       env
     );
-    assert.equal(r3.headers.get('access-control-allow-origin'), 'https://ops.apexhive.example');
+    assert.equal(rAllowed.headers.get('access-control-allow-origin'), 'https://ops.example');
   });
 
-  it('serves Zero-CDN XSS-safe dashboard with white-label HTML report export and zero unsafe DOM sinks', () => {
+  it('serves Zero-CDN XSS-safe dashboard with neutral white-label export and zero ApexHive/wallet/commercial strings', () => {
     const html = renderDashboardHtml();
     assert.ok(!html.includes('innerHTML'));
     assert.ok(!html.includes('outerHTML'));
     assert.ok(!html.includes('insertAdjacentHTML'));
     assert.ok(!html.includes('document.write'));
     assert.ok(!html.includes('eval('));
+    assert.ok(!html.includes('ApexHive'));
+    assert.ok(!html.includes('USDC'));
+    assert.ok(!/0x[0-9a-fA-F]{40}/.test(html));
     assert.ok(html.includes('textContent'));
-    assert.ok(html.includes('Export White-Label Client HTML Report'));
-    assert.ok(html.includes(APEXHIVE_BASE_USDC_RECIPIENT));
+    assert.ok(html.includes('Export White-Label HTML Report'));
   });
 
-  it('enforces fail-closed 500, RPC confirmations, EIP-191 EOA, ERC-1271/6492 Smart Wallet, atomic replay lock & Ed25519 certs', async () => {
-    const payer = privateKeyToAccount('0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80');
-    const attacker = privateKeyToAccount('0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d');
-    const smartWalletAddr = '0x4444444444444444444444444444444444444444';
-    const smartWalletSig = '0x' + 'cc'.repeat(256);
-
-    const txTeam = '0x' + '11'.repeat(32);
-    const txUnderpaid = '0x' + '22'.repeat(32);
-    const txEnterpriseSmart = '0x' + '33'.repeat(32);
-    const txFake = '0x' + '99'.repeat(32);
-
-    const rpcState = {
-      flakyHits: 0,
-      headBlock: 100,
-      smartWalletAddr,
-      receipts: new Map([
-        [
-          txTeam,
-          {
-            status: '0x1',
-            blockNumber: '0x64', // block 100 -> 1 conf initially, 2 confs once headBlock=101
-            logs: [encodeUsdcTransferLog(payer.address, APEXHIVE_BASE_USDC_RECIPIENT, 99_000_000n)]
-          }
-        ],
-        [
-          txUnderpaid,
-          {
-            status: '0x1',
-            blockNumber: '0x62',
-            logs: [encodeUsdcTransferLog(payer.address, APEXHIVE_BASE_USDC_RECIPIENT, 50_000_000n)]
-          }
-        ],
-        [
-          txEnterpriseSmart,
-          {
-            status: '0x1',
-            blockNumber: '0x62',
-            logs: [encodeUsdcTransferLog(smartWalletAddr, APEXHIVE_BASE_USDC_RECIPIENT, 499_000_000n)]
-          }
-        ]
-      ])
-    };
-
-    const rpcServer = await startMockBaseRpc(rpcState);
-    const rpcPort = rpcServer.address().port;
-
-    try {
-      const { privateJwkJson, spkiB64, pubPem } = await generateEd25519Keypair();
-
-      // 0. Fail-closed 500 when LICENSE_SIGNING_PRIVATE_JWK missing
-      const { env: unconfiguredEnv } = createSqliteDoEnv({
-        BASE_RPC_URLS: `http://127.0.0.1:${rpcPort}/ok`
-      });
-      const r500 = await handleWorkerFetch(
-        new Request('https://worker.local/api/license/verify', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ txHash: txTeam, nonce: '12345678', signature: '0x' + 'aa'.repeat(65), tier: 'team' })
-        }),
-        unconfiguredEnv
-      );
-      assert.equal(r500.status, 500);
-
-      const { env } = createSqliteDoEnv({
-        BASE_RPC_URLS: `http://127.0.0.1:${rpcPort}/flaky,http://127.0.0.1:${rpcPort}/ok`,
-        BASE_USDC_CONTRACT,
-        PAY_TO_EVM_ADDRESS: APEXHIVE_BASE_USDC_RECIPIENT,
-        MIN_CONFIRMATIONS: '2',
-        LICENSE_SIGNING_PRIVATE_JWK: privateJwkJson,
-        LICENSE_SIGNING_PUBLIC_SPKI_B64: spkiB64
-      });
-
-      // 1. Challenge fails cleanly on invalid tier
-      const badTier = await handleWorkerFetch(
-        new Request('https://worker.local/api/license/challenge', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ txHash: txTeam, tier: 'solo' })
-        }),
-        env
-      );
-      assert.equal(badTier.status, 400);
-
-      // 2. Request Team challenge -> 1-conf rejected -> head advances -> bad attacker sig rejected -> payer sig passes
-      const chTeam = await (
-        await handleWorkerFetch(
-          new Request('https://worker.local/api/license/challenge', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ txHash: txTeam, tier: 'team' })
-          }),
-          env
-        )
-      ).json();
-      assert.ok(chTeam.nonce && chTeam.message.includes('product=dmarczero'));
-
-      const sigPayer = await payer.signMessage({ message: chTeam.message });
-      const sigAttacker = await attacker.signMessage({ message: chTeam.message });
-
-      const conf1Res = await handleWorkerFetch(
-        new Request('https://worker.local/api/license/verify', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            tier: 'team',
-            holder: 'Acme Agency',
-            txHash: txTeam,
-            nonce: chTeam.nonce,
-            signature: sigPayer
-          })
-        }),
-        env
-      );
-      assert.equal(conf1Res.status, 403);
-      assert.equal((await conf1Res.json()).error, 'INSUFFICIENT_CONFIRMATIONS');
-      assert.ok(rpcState.flakyHits >= 2, 'Expected Base RPC failover');
-
-      // Advance block -> 2 confirmations
-      rpcState.headBlock = 101;
-
-      const badSigRes = await handleWorkerFetch(
-        new Request('https://worker.local/api/license/verify', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            tier: 'team',
-            holder: 'Acme Agency',
-            txHash: txTeam,
-            nonce: chTeam.nonce,
-            signature: sigAttacker
-          })
-        }),
-        env
-      );
-      assert.equal(badSigRes.status, 403);
-      assert.equal((await badSigRes.json()).error, 'PAYMENT_OR_SIGNATURE_INVALID');
-
-      // Real payer signature succeeds & issues Ed25519 certificate verifiable offline
-      const okRes = await handleWorkerFetch(
-        new Request('https://worker.local/api/license/verify', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            tier: 'team',
-            holder: 'Acme Agency',
-            txHash: txTeam,
-            nonce: chTeam.nonce,
-            signature: sigPayer
-          })
-        }),
-        env
-      );
-      assert.equal(okRes.status, 200);
-      const okBody = await okRes.json();
-      assert.equal(okBody.valid, true);
-      assert.equal(okBody.tier, 'team');
-      assert.equal(okBody.paidAtomic, '99000000');
-      assert.equal(okBody.featuresUnlocked, true);
-      assert.ok(okBody.certificate?.signature);
-
-      const certVerified = crypto.verify(
-        null,
-        Buffer.from(canonicalizeLicensePayload(okBody.certificate.payload), 'utf8'),
-        pubPem,
-        Buffer.from(okBody.certificate.signature, 'base64url')
-      );
-      assert.equal(certVerified, true);
-
-      // 3. Replay with a fresh nonce against same txHash must fail 409 TX_ALREADY_CLAIMED
-      const chReplay = await (
-        await handleWorkerFetch(
-          new Request('https://worker.local/api/license/challenge', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ txHash: txTeam, tier: 'team' })
-          }),
-          env
-        )
-      ).json();
-      const replaySig = await payer.signMessage({ message: chReplay.message });
-      const replayRes = await handleWorkerFetch(
-        new Request('https://worker.local/api/license/verify', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            tier: 'team',
-            holder: 'Acme Agency',
-            txHash: txTeam,
-            nonce: chReplay.nonce,
-            signature: replaySig
-          })
-        }),
-        env
-      );
-      assert.equal(replayRes.status, 409);
-      assert.equal((await replayRes.json()).error, 'TX_ALREADY_CLAIMED');
-
-      // 4. Fake non-existent txHash fails closed 403 TX_NOT_CONFIRMED
-      const chFake = await (
-        await handleWorkerFetch(
-          new Request('https://worker.local/api/license/challenge', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ txHash: txFake, tier: 'team' })
-          }),
-          env
-        )
-      ).json();
-      const fakeRes = await handleWorkerFetch(
-        new Request('https://worker.local/api/license/verify', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            tier: 'team',
-            txHash: txFake,
-            nonce: chFake.nonce,
-            signature: await payer.signMessage({ message: chFake.message })
-          })
-        }),
-        env
-      );
-      assert.equal(fakeRes.status, 403);
-      assert.equal((await fakeRes.json()).error, 'TX_NOT_CONFIRMED');
-
-      // 5. Underpaid 50 USDC tx fails 403 PAYMENT_OR_SIGNATURE_INVALID
-      const chUnder = await (
-        await handleWorkerFetch(
-          new Request('https://worker.local/api/license/challenge', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ txHash: txUnderpaid, tier: 'team' })
-          }),
-          env
-        )
-      ).json();
-      const underRes = await handleWorkerFetch(
-        new Request('https://worker.local/api/license/verify', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            tier: 'team',
-            txHash: txUnderpaid,
-            nonce: chUnder.nonce,
-            signature: await payer.signMessage({ message: chUnder.message })
-          })
-        }),
-        env
-      );
-      assert.equal(underRes.status, 403);
-      assert.equal((await underRes.json()).error, 'PAYMENT_OR_SIGNATURE_INVALID');
-
-      // 6. Concurrent Smart Wallet (ERC-1271 / EIP-6492) Enterprise 499 USDC race: 1 wins 200, 1 loses 409
-      const [swCh1, swCh2] = await Promise.all([
-        (
-          await handleWorkerFetch(
-            new Request('https://worker.local/api/license/challenge', {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ txHash: txEnterpriseSmart, tier: 'enterprise' })
-            }),
-            env
-          )
-        ).json(),
-        (
-          await handleWorkerFetch(
-            new Request('https://worker.local/api/license/challenge', {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ txHash: txEnterpriseSmart, tier: 'enterprise' })
-            }),
-            env
-          )
-        ).json()
-      ]);
-
-      const [swRes1, swRes2] = await Promise.all([
-        handleWorkerFetch(
-          new Request('https://worker.local/api/license/verify', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              tier: 'enterprise',
-              holder: 'Global MSP Enterprise',
-              txHash: txEnterpriseSmart,
-              nonce: swCh1.nonce,
-              signature: smartWalletSig
-            })
-          }),
-          env
-        ),
-        handleWorkerFetch(
-          new Request('https://worker.local/api/license/verify', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              tier: 'enterprise',
-              holder: 'Global MSP Enterprise',
-              txHash: txEnterpriseSmart,
-              nonce: swCh2.nonce,
-              signature: smartWalletSig
-            })
-          }),
-          env
-        )
-      ]);
-      assert.deepEqual([swRes1.status, swRes2.status].sort((a, b) => a - b), [200, 409]);
-    } finally {
-      rpcServer.close();
-    }
-  });
-
-  it('boots real wrangler dev --local and verifies /api/health, /api/config, dashboard HTML & fail-closed /api/license/verify', async () => {
+  it('boots real wrangler dev --local and verifies /api/health, fail-closed auth & protected /api/summary', async () => {
     const wranglerJs = path.join(WORKER_DIR, 'node_modules', 'wrangler', 'bin', 'wrangler.js');
     assert.ok(existsSync(wranglerJs), `Expected wrangler entrypoint at ${wranglerJs}`);
 
-    const rpcState = { flakyHits: 0, headBlock: 100, smartWalletAddr: '0x0000000000000000000000000000000000000000', receipts: new Map() };
-    const rpcServer = await startMockBaseRpc(rpcState);
-    const rpcPort = rpcServer.address().port;
     const port = await getFreePort();
     const baseUrl = `http://127.0.0.1:${port}`;
-    const { privateJwkJson } = await generateEd25519Keypair();
+    const adminToken = 'wrangler-local-test-token-42';
 
     const tempHome = mkdtempSync(path.join(os.tmpdir(), 'dmarczero-wrangler-'));
     const devVarsPath = path.join(WORKER_DIR, '.dev.vars');
-    writeFileSync(
-      devVarsPath,
-      [
-        `LICENSE_SIGNING_PRIVATE_JWK=${privateJwkJson}`,
-        `BASE_RPC_URLS=http://127.0.0.1:${rpcPort}/ok`,
-        `BASE_RPC_URL=http://127.0.0.1:${rpcPort}/ok`
-      ].join('\n'),
-      'utf8'
-    );
+    writeFileSync(devVarsPath, `DASHBOARD_ADMIN_TOKEN=${adminToken}\n`, 'utf8');
 
     let logs = '';
     const proc = spawn(
@@ -686,40 +833,27 @@ describe('cloudflare-worker: CORS, Zero-XSS White-Label Dashboard & Real Base US
     try {
       await waitForHealth(`${baseUrl}/api/health`, proc, () => logs);
 
-      const health = await (await fetch(`${baseUrl}/api/health`)).json();
-      assert.equal(health.status, 'ok');
-      assert.equal(health.durableObjectLockBound, true);
-      assert.deepEqual(health.smartWalletSupport, ['EOA', 'ERC-1271', 'EIP-6492']);
+      const healthResp = await fetch(`${baseUrl}/api/health`);
+      const health = await healthResp.json();
+      assert.deepEqual(health, { ok: true, service: 'dmarczero-worker', version: '1.0.0' });
+      assert.equal(healthResp.headers.get('x-frame-options'), 'DENY');
 
-      const cfg = await (await fetch(`${baseUrl}/api/config`)).json();
-      assert.equal(cfg.tiers.solo.priceUsd, '0');
-      assert.equal(cfg.tiers.team.priceAtomic, '99000000');
-      assert.equal(cfg.tiers.enterprise.priceAtomic, '499000000');
+      const unauthedSummary = await fetch(`${baseUrl}/api/summary`);
+      assert.equal(unauthedSummary.status, 401);
 
-      const dashHtml = await (await fetch(`${baseUrl}/`)).text();
-      assert.ok(dashHtml.includes('Export White-Label Client HTML Report'));
+      const unauthedDash = await fetch(`${baseUrl}/`);
+      assert.equal(unauthedDash.status, 401);
 
-      const txFake = '0x' + 'fe'.repeat(32);
-      const ch = await (
-        await fetch(`${baseUrl}/api/license/challenge`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ txHash: txFake, tier: 'team' })
-        })
-      ).json();
-      const payer = privateKeyToAccount('0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80');
-      const fakeVerify = await fetch(`${baseUrl}/api/license/verify`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          txHash: txFake,
-          nonce: ch.nonce,
-          signature: await payer.signMessage({ message: ch.message }),
-          tier: 'team'
-        })
+      const authedDash = await fetch(`${baseUrl}/`, {
+        headers: { authorization: `Bearer ${adminToken}` }
       });
-      assert.equal(fakeVerify.status, 403);
-      assert.equal((await fakeVerify.json()).error, 'TX_NOT_CONFIRMED');
+      assert.equal(authedDash.status, 200);
+      assert.ok((await authedDash.text()).includes('Export White-Label HTML Report'));
+
+      const authedSummary = await fetch(`${baseUrl}/api/summary`, {
+        headers: { authorization: `Bearer ${adminToken}` }
+      });
+      assert.equal(authedSummary.status, 200);
     } finally {
       if (proc.exitCode === null) {
         if (process.platform === 'win32' && proc.pid) {
@@ -739,7 +873,6 @@ describe('cloudflare-worker: CORS, Zero-XSS White-Label Dashboard & Real Base US
         }
         await new Promise((r) => setTimeout(r, 400));
       }
-      rpcServer.close();
       rmSync(devVarsPath, { force: true });
       await rmAsync(tempHome, { recursive: true, force: true, maxRetries: 15, retryDelay: 250 }).catch(() => {});
     }

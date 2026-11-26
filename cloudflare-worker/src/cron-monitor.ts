@@ -11,29 +11,38 @@ export interface WebhookValidationResult {
   url?: URL;
 }
 
+export interface DomainValidationResult {
+  valid: boolean;
+  domain?: string;
+  reason?: string;
+}
+
 function isPrivateOrLoopbackHost(hostname: string): boolean {
-  const lower = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const lower = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
+  if (!lower) return true;
+
   if (
     lower === 'localhost' ||
+    lower.endsWith('.localhost') ||
     lower.endsWith('.local') ||
     lower.endsWith('.internal') ||
-    lower === '::1' ||
-    lower === '0:0:0:0:0:0:0:1' ||
-    lower.startsWith('fc') ||
-    lower.startsWith('fd') ||
-    lower.startsWith('fe80:')
+    lower.endsWith('.arpa')
   ) {
     return true;
   }
 
-  // Reject any literal IPv4 address (especially RFC1918 / loopback / link-local / metadata)
-  const ipv4Match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(lower);
-  if (ipv4Match) {
+  // Reject any literal IPv6 address (including ::, ::1, ::ffff:..., fe80:, fc00:, fd00:)
+  if (lower.includes(':')) {
     return true;
   }
 
-  // Reject raw IPv6 literals
-  if (lower.includes(':')) {
+  // Reject any literal or abbreviated IPv4 / numeric IP host (e.g. 127.0.0.1, 127.1, 2130706433, 0x7f000001)
+  if (/^\d+(?:\.\d+){0,3}$/.test(lower) || /^0x[0-9a-f]+$/i.test(lower)) {
+    return true;
+  }
+
+  // Require at least two labels (blocks single-label internal hostnames)
+  if (!lower.includes('.')) {
     return true;
   }
 
@@ -41,9 +50,48 @@ function isPrivateOrLoopbackHost(hostname: string): boolean {
 }
 
 /**
+ * Validates MONITORED_DOMAINS entries as strict public FQDNs.
+ * Blocks IPv4/IPv6 literals, localhost, .local/.internal/.arpa, ports, paths, and SSRF targets.
+ */
+export function validateMonitoredDomain(raw: string): DomainValidationResult {
+  const norm = raw.trim().toLowerCase().replace(/\.+$/, '');
+  if (!norm) {
+    return { valid: false, reason: 'Empty domain' };
+  }
+  if (norm.length > 253) {
+    return { valid: false, reason: 'Domain exceeds 253 characters' };
+  }
+  if (/[\s/\\@:?#[\]%*]/.test(norm)) {
+    return { valid: false, reason: `Domain contains disallowed characters: ${norm}` };
+  }
+  if (isPrivateOrLoopbackHost(norm)) {
+    return { valid: false, reason: `Blocked private, loopback, or IP target: ${norm}` };
+  }
+
+  const labels = norm.split('.');
+  if (labels.length < 2) {
+    return { valid: false, reason: `Domain must be a multi-label FQDN: ${norm}` };
+  }
+
+  const labelRe = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+  for (const label of labels) {
+    if (!labelRe.test(label)) {
+      return { valid: false, reason: `Invalid DNS label "${label}" in domain: ${norm}` };
+    }
+  }
+
+  const tld = labels[labels.length - 1] ?? '';
+  if (/^\d+$/.test(tld)) {
+    return { valid: false, reason: `Invalid numeric TLD in domain: ${norm}` };
+  }
+
+  return { valid: true, domain: norm };
+}
+
+/**
  * SSRF-hardened webhook URL validator:
  * - Requires HTTPS
- * - Rejects embedded credentials, non-443 ports, IP literals, and private/loopback hostnames
+ * - Rejects embedded credentials, non-443 ports, IPv4/IPv6 literals, and private/loopback hostnames
  * - Enforces explicit hostname allowlist (Discord, Telegram, Slack, or configured allowlist)
  */
 export function validateWebhookUrl(
@@ -73,12 +121,15 @@ export function validateWebhookUrl(
     return { valid: false, reason: `Blocked private/loopback/IP host: ${parsed.hostname}` };
   }
 
-  const allowed = new Set<string>([
-    ...DEFAULT_WEBHOOK_ALLOWLIST,
-    ...extraAllowedHosts.map((h) => h.trim().toLowerCase()).filter(Boolean)
-  ]);
+  const allowed = new Set<string>(DEFAULT_WEBHOOK_ALLOWLIST);
+  for (const rawHost of extraAllowedHosts) {
+    const clean = rawHost.trim().toLowerCase().replace(/\.+$/, '');
+    if (clean && !isPrivateOrLoopbackHost(clean) && !/[/:@\s]/.test(clean)) {
+      allowed.add(clean);
+    }
+  }
 
-  const host = parsed.hostname.toLowerCase();
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, '');
   if (!allowed.has(host)) {
     return { valid: false, reason: `Webhook host "${host}" is not in the SSRF allowlist` };
   }
@@ -91,6 +142,8 @@ export async function sendSafeWebhookAlert(
   message: string,
   options: {
     extraAllowedHosts?: string[];
+    telegramChatId?: string;
+    timeoutMs?: number;
     fetchFn?: typeof fetch;
   } = {}
 ): Promise<{ sent: boolean; status?: number; reason?: string }> {
@@ -99,31 +152,45 @@ export async function sendSafeWebhookAlert(
     return { sent: false, reason: check.reason ?? 'Blocked by SSRF guard' };
   }
 
-  const host = check.url.hostname.toLowerCase();
+  const host = check.url.hostname.toLowerCase().replace(/\.+$/, '');
   let body: Record<string, unknown>;
   if (host === 'discord.com' || host === 'discordapp.com') {
     body = { content: message };
   } else if (host === 'hooks.slack.com') {
     body = { text: message };
   } else if (host === 'api.telegram.org') {
-    body = { text: message };
+    const chatId = (options.telegramChatId ?? check.url.searchParams.get('chat_id') ?? '').trim();
+    if (!chatId) {
+      return {
+        sent: false,
+        reason: 'Missing TELEGRAM_CHAT_ID (or chat_id query parameter) for api.telegram.org webhook'
+      };
+    }
+    body = { chat_id: chatId, text: message };
   } else {
     body = { text: message, content: message };
   }
 
   const fetchImpl = options.fetchFn ?? fetch;
-  const resp = await fetchImpl(check.url.toString(), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-    redirect: 'manual'
-  });
+  const timeoutMs = options.timeoutMs ?? 8000;
+  try {
+    const resp = await fetchImpl(check.url.toString(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(timeoutMs)
+    });
 
-  if (resp.status >= 300 && resp.status < 400) {
-    return { sent: false, status: resp.status, reason: 'Blocked 3xx redirect from webhook endpoint' };
+    if (resp.status >= 300 && resp.status < 400) {
+      return { sent: false, status: resp.status, reason: 'Blocked 3xx redirect from webhook endpoint' };
+    }
+
+    return { sent: resp.ok, status: resp.status, reason: resp.ok ? undefined : `HTTP ${resp.status}` };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { sent: false, reason: `Webhook request failed: ${msg}` };
   }
-
-  return { sent: resp.ok, status: resp.status, reason: resp.ok ? undefined : `HTTP ${resp.status}` };
 }
 
 export interface DohDnsSnapshot {
@@ -152,7 +219,8 @@ async function queryDoh(
   const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`;
   const resp = await fetchFn(url, {
     headers: { accept: 'application/dns-json' },
-    redirect: 'manual'
+    redirect: 'manual',
+    signal: AbortSignal.timeout(5000)
   });
   if (!resp.ok) return [];
   const data = (await resp.json()) as DohResponse;
@@ -162,16 +230,21 @@ async function queryDoh(
 }
 
 /**
- * Probes HTTPS/TLS reachability for a monitored domain (without following redirects).
+ * Probes HTTPS/TLS reachability for a validated monitored FQDN (without following redirects).
  */
 export async function probeDomainHttpsTls(
   domain: string,
   fetchFn: typeof fetch = fetch
 ): Promise<{ tlsStatus: 'ok' | 'error'; tlsDetail: string }> {
+  const check = validateMonitoredDomain(domain);
+  if (!check.valid || !check.domain) {
+    return { tlsStatus: 'error', tlsDetail: check.reason ?? 'Invalid monitored domain' };
+  }
   try {
-    const resp = await fetchFn(`https://${domain}/`, {
+    const resp = await fetchFn(`https://${check.domain}/`, {
       method: 'HEAD',
-      redirect: 'manual'
+      redirect: 'manual',
+      signal: AbortSignal.timeout(5000)
     });
     return { tlsStatus: 'ok', tlsDetail: `HTTPS ${resp.status}` };
   } catch (err: unknown) {
@@ -184,7 +257,11 @@ export async function fetchDomainDnsSnapshot(
   domain: string,
   fetchFn: typeof fetch = fetch
 ): Promise<DohDnsSnapshot> {
-  const norm = domain.trim().toLowerCase().replace(/\.$/, '');
+  const check = validateMonitoredDomain(domain);
+  if (!check.valid || !check.domain) {
+    throw new Error(check.reason ?? `Invalid monitored domain: ${domain}`);
+  }
+  const norm = check.domain;
   const [rootTxt, dmarcTxt, mxRaw, tlsProbe] = await Promise.all([
     queryDoh(norm, 'TXT', fetchFn),
     queryDoh(`_dmarc.${norm}`, 'TXT', fetchFn),

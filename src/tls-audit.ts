@@ -37,6 +37,7 @@ export interface TlsAuditOptions {
   timeoutMs?: number;
   startTls?: boolean;
   now?: Date;
+  ca?: string | Buffer | Array<string | Buffer>;
 }
 
 function formatDn(dn: tls.Certificate | undefined): string {
@@ -51,8 +52,9 @@ function formatDn(dn: tls.Certificate | undefined): string {
   return parts.join(', ');
 }
 
-function classifyDaysRemaining(daysRemaining: number): TlsStatus {
+function classifyTlsStatus(daysRemaining: number, authorized: boolean): TlsStatus {
   if (daysRemaining < 0) return 'expired';
+  if (!authorized) return 'error';
   if (daysRemaining < 14) return 'critical';
   if (daysRemaining < 30) return 'warning';
   return 'ok';
@@ -157,6 +159,9 @@ export async function auditTls(host: string, options: TlsAuditOptions = {}): Pro
       if (servername) {
         connectOpts.servername = servername;
       }
+      if (options.ca !== undefined) {
+        connectOpts.ca = options.ca;
+      }
 
       const socket = tls.connect(connectOpts, () => {
         try {
@@ -171,7 +176,13 @@ export async function auditTls(host: string, options: TlsAuditOptions = {}): Pro
           const validFromDate = new Date(peer.valid_from);
           const msRemaining = validToDate.getTime() - now.getTime();
           const daysRemaining = Math.floor(msRemaining / (1000 * 60 * 60 * 24));
-          const status = classifyDaysRemaining(daysRemaining);
+          const authorized = Boolean(socket.authorized);
+          const authorizationError = socket.authorizationError
+            ? String(socket.authorizationError)
+            : authorized
+              ? null
+              : 'Certificate verification failed';
+          const status = classifyTlsStatus(daysRemaining, authorized);
           const chain = extractChain(peer);
 
           const out: TlsAuditResult = {
@@ -180,8 +191,8 @@ export async function auditTls(host: string, options: TlsAuditOptions = {}): Pro
             servername: servername || host,
             checkedAt,
             reachable: true,
-            authorized: socket.authorized,
-            authorizationError: socket.authorizationError ? String(socket.authorizationError) : null,
+            authorized,
+            authorizationError,
             protocol: socket.getProtocol(),
             subject: formatDn(peer.subject),
             issuer: formatDn(peer.issuer),

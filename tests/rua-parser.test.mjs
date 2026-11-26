@@ -59,10 +59,21 @@ const SAMPLE_RUA_XML = `<?xml version="1.0" encoding="UTF-8" ?>
   </record>
 </feedback>`;
 
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    c ^= buf[i];
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
 function buildSingleFileZip(filename, contentBuffer) {
   const nameBuf = Buffer.from(filename, 'utf8');
   const compressed = zlib.deflateRawSync(contentBuffer);
-  const crc = zlib.crc32(contentBuffer);
+  const crc = crc32(contentBuffer);
 
   // Local file header (30 bytes + filename)
   const localHeader = Buffer.alloc(30 + nameBuf.length);
@@ -151,6 +162,72 @@ describe('rua-parser: streaming RUA XML / .gz / .zip, RUF rejection & OOM guard'
       () => parseRuaBuffer(Buffer.from(SAMPLE_RUA_XML, 'utf8'), { filenameHint: 'mail!ruf!1234.xml' }),
       (err) => err instanceof RufRejectedError
     );
+  });
+
+  it('inspects full stream past 256B and rejects RUF markers or multi-entry ZIPs hiding RUF/oversized STORE', async () => {
+    const padding = '<!-- ' + 'X'.repeat(600) + ' -->\n';
+    const lateRufStream = Readable.from([
+      padding.slice(0, 300),
+      padding.slice(300) + '<feedback><forensic><sample_message>secret</sample_message></forensic></feedback>'
+    ]);
+    await assert.rejects(
+      () => parseRuaXmlStream(lateRufStream),
+      (err) => err instanceof RufRejectedError
+    );
+
+    const splitHeadersStream = Readable.from([
+      'X-Header: 1\r\n' + 'A'.repeat(400) + '\r\nOriginal-Mail-From: a@b.com\r\n',
+      'B'.repeat(700) + '\r\nArrival-Date: Thu, 26 Nov 2026 00:00:00 +0000\r\n'
+    ]);
+    await assert.rejects(
+      () => parseRuaXmlStream(splitHeadersStream),
+      (err) => err instanceof RufRejectedError
+    );
+
+    // Multi-file ZIP where entry #1 is valid RUA and entry #2 is hidden RUF
+    const name1 = Buffer.from('valid.xml', 'utf8');
+    const data1 = Buffer.from(SAMPLE_RUA_XML, 'utf8');
+    const name2 = Buffer.from('hidden!ruf!2.xml', 'utf8');
+    const data2 = Buffer.from('<feedback/>', 'utf8');
+    const makeLocal = (n, d) => {
+      const h = Buffer.alloc(30 + n.length);
+      h.writeUInt32LE(0x04034b50, 0);
+      h.writeUInt16LE(20, 4);
+      h.writeUInt16LE(0, 8); // STORE
+      h.writeUInt32LE(crc32(d), 14);
+      h.writeUInt32LE(d.length, 18);
+      h.writeUInt32LE(d.length, 22);
+      h.writeUInt16LE(n.length, 26);
+      n.copy(h, 30);
+      return Buffer.concat([h, d]);
+    };
+    const multiZip = Buffer.concat([makeLocal(name1, data1), makeLocal(name2, data2)]);
+    await assert.rejects(
+      () => parseRuaBuffer(multiZip),
+      (err) => err instanceof RufRejectedError
+    );
+    // Case-insensitive metadata/policy tags + multi-entry ZIP with corrupt 2nd deflate stream does not throw unhandled error
+    const upperXml = SAMPLE_RUA_XML
+      .replace(/<report_metadata>/g, '<REPORT_METADATA>')
+      .replace(/<\/report_metadata>/g, '</REPORT_METADATA>')
+      .replace(/<policy_published>/g, '<POLICY_PUBLISHED>')
+      .replace(/<\/policy_published>/g, '</POLICY_PUBLISHED>');
+    const upperRes = await parseRuaBuffer(Buffer.from(upperXml, 'utf8'));
+    assert.equal(upperRes.metadata.orgName, 'google.com');
+    assert.equal(upperRes.policyPublished.domain, 'apexhive.example');
+
+    const badDeflateName = Buffer.from('corrupt.xml', 'utf8');
+    const badDeflateData = Buffer.from([0xff, 0xff, 0xff, 0xff]);
+    const hBad = Buffer.alloc(30 + badDeflateName.length);
+    hBad.writeUInt32LE(0x04034b50, 0);
+    hBad.writeUInt16LE(20, 4);
+    hBad.writeUInt16LE(8, 8); // DEFLATE
+    hBad.writeUInt32LE(badDeflateData.length, 18);
+    hBad.writeUInt32LE(10, 22);
+    hBad.writeUInt16LE(badDeflateName.length, 26);
+    badDeflateName.copy(hBad, 30);
+    const corruptMultiZip = Buffer.concat([makeLocal(name1, data1), hBad, badDeflateData]);
+    await assert.rejects(() => parseRuaBuffer(corruptMultiZip));
   });
 
   it('enforces maxUncompressedBytes OOM / zip-bomb guard during streaming', async () => {
