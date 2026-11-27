@@ -1,8 +1,8 @@
 # DMARCZero
 
-**Zero-dependency Node.js DNS / DMARC / TLS anti-drift guard and streaming aggregate (`RUA`) analyzer (strictly rejects `RUF` forensic reports).**
+**Audit email authentication DNS records, catch accidental SPF/DMARC/TLS drift in CI, and stream-parse DMARC aggregate (`RUA`) reports without Elasticsearch or recurring SaaS fees.**
 
-100% free and open-source under the **MIT License**, built for **Node.js >= 20.0.0** (CLI/core) and self-hosted **Cloudflare Email Workers** (`Node.js >= 22.13.0` for local Wrangler/SQLite tests).
+Built with zero runtime dependencies for **Node.js >= 20.0.0** (CLI/core) and self-hosted **Cloudflare Email Workers** (`Node.js >= 22.13.0` for local Wrangler/SQLite tests), strictly rejecting `RUF` forensic reports containing email PII. Licensed under [MIT](./LICENSE).
 
 ## Why DMARCZero?
 
